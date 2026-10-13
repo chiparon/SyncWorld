@@ -8,6 +8,8 @@
     "node": ">=22.18"
   },
   "scripts": {
+    "syncw": "node src/cli/syncw.ts",
+    "status": "node src/cli/syncw.ts status",
     "postoffice": "node src/postoffice/main.ts",
     "test": "node --test \"test/**/*.test.ts\"",
     "typecheck": "tsc --noEmit",
