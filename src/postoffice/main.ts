@@ -1,7 +1,7 @@
 import { execFile } from 'node:child_process';
-import { readFileSync } from 'node:fs';
+import { readFileSync, realpathSync } from 'node:fs';
 import { join, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { parseArgs, promisify } from 'node:util';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 
@@ -75,7 +75,24 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
   await server.connect(new StdioServerTransport());
 }
 
-if (import.meta.main) {
+/**
+ * `import.meta.main` is missing on older Node versions within our `engines`
+ * range, and there it is undefined, which would make the server exit silently
+ * without ever starting. Fall back to comparing paths, case-insensitively
+ * because Windows may report the drive letter in either case.
+ */
+function isEntryPoint(): boolean {
+  if (typeof import.meta.main === 'boolean') return import.meta.main;
+  const entry = process.argv[1];
+  if (entry === undefined) return false;
+  try {
+    return pathToFileURL(realpathSync(entry)).href.toLowerCase() === import.meta.url.toLowerCase();
+  } catch {
+    return false;
+  }
+}
+
+if (isEntryPoint()) {
   try {
     await main();
   } catch (error) {
