@@ -343,6 +343,21 @@ export interface AgentSummary {
   last_summary?: string;
 }
 
+/** What `createPostOffice` in src/postoffice/core.ts needs. Everything is injected, so tests can swap any part. */
+export interface PostOfficeOptions {
+  registry: Registry;
+  worktrees: Worktrees;
+  engine: Engine;
+  /** Directory of role templates, one `<role>.md` per role. */
+  roles_dir: string;
+  /** Repository used when spawn_agent names none. */
+  default_repo: string;
+  /** Absolute path of src/schema/result.schema.json. */
+  result_schema_path: string;
+  /** Merged over the defaults in PostOfficeLimits. */
+  limits?: Partial<PostOfficeLimits>;
+}
+
 export interface PostOffice {
   spawnAgent(input: SpawnAgentInput): Promise<SpawnAgentOutput>;
   sendMessage(input: SendMessageInput): Promise<SendMessageOutput>;
