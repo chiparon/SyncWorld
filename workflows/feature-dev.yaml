@@ -1,0 +1,172 @@
+# The showcase workflow.
+#
+# It exercises every mechanism that makes Syncw different from a normal agent
+# framework, and each one is a single declarative line:
+#
+#   plan       policy binding + fallback chain (no model named)
+#   research   heterogeneous fan-out - one vendor per item, parallel
+#   judge      cross-family constraint resolved against what research ACTUALLY ran
+#   gate       conditional human checkpoint
+#   implement  quality floor + cost preference + escalation on failure
+#   verify     adversarial check by a different lineage than the author
+#
+# Nothing in this file names a model except the deliberate by_index list, which
+# is the one place where naming a vendor *is* the requirement.
+
+name: feature-dev
+
+description: >
+  Plan a feature, research the open questions across three vendors in parallel,
+  judge the findings from outside those vendors' lineages, pause for a human,
+  implement on the cheapest model that clears a quality floor, then have a
+  different lineage try to break it.
+
+input:
+  goal:
+    type: string
+    required: true
+    default: Ship a per-tenant rate limiter for the public API
+
+budget:
+  max_usd: 5.00
+
+world:
+  plan:
+    type: json
+    merge: replace
+    owner: plan
+
+  # Append, not replace. Three concurrent researchers write here, and the merge
+  # strategy is what makes that safe rather than lucky.
+  findings:
+    type: json
+    merge: append
+    description: One entry per research item, appended in completion order.
+
+  # Single-writer by construction. If a second node ever tries to write this,
+  # `owner:` fails the run rather than silently clobbering the verdict.
+  verdict:
+    type: json
+    merge: replace
+    owner: judge
+
+  patches:
+    type: json
+    merge: replace
+    owner: implement
+
+  review:
+    type: json
+    merge: replace
+    owner: verify
+
+nodes:
+  # ---------------------------------------------------------------------------
+  - id: plan
+    agent: planner
+    bind:
+      require: [json_schema, ctx>=200k]
+      prefer: quality
+      fallback: [deepseek/*, google/*]
+    in:
+      goal: $.input.goal
+    out: [plan]
+
+  # ---------------------------------------------------------------------------
+  # Heterogeneous fan-out. `by_index` gives item i to a different vendor, so the
+  # three answers come from genuinely independent lineages rather than three
+  # samples of the same one.
+  #
+  # `join: all` means a single failed worker fails the node - which is why the
+  # implement node below carries an escalation policy and this one does not need
+  # to: research is cheap, silent partial research is not.
+  - id: research
+    agent: researcher
+    needs: [plan]
+    for_each: $.world.plan.steps
+    join: all
+    bind:
+      by_index:
+        - anthropic/claude-sonnet-4-5
+        - openai/gpt-5
+        - google/gemini-2-5-pro
+    budget:
+      max_parallel: 3
+      max_usd: 1.00
+    in:
+      question: $.item.title
+      plan: $.world.plan
+    out: [findings]
+
+  # ---------------------------------------------------------------------------
+  # The constraint that justifies the whole architecture: the judge must not
+  # share a lineage with any model that actually produced a finding. Because
+  # `research` runs a fan-out, the reference resolves to the list of families
+  # really used, not a single declared value.
+  #
+  # Note what the fallback can and cannot do here. If the chosen judge fails at
+  # runtime, the fallback chain is walked - and it will happily relax
+  # `json_schema`. It will never relax `not_family_of`. Safety constraints are
+  # inviolable; resource constraints degrade. That distinction is enforced by
+  # the engine, not by convention.
+  - id: judge
+    agent: critic
+    needs: [research]
+    retries: 1
+    bind:
+      require:
+        - json_schema
+        - not_family_of:$.nodes.research.actual_families
+      prefer: quality
+      fallback: [deepseek/*, google/*, openai/*]
+    in:
+      findings: $.world.findings
+    out: [verdict]
+
+  # ---------------------------------------------------------------------------
+  # Conditional checkpoint. Only fires when the judge is not confident enough to
+  # proceed unattended; otherwise it is skipped and costs nothing.
+  - id: gate
+    kind: human_gate
+    needs: [judge]
+    when: $.world.verdict.confidence < 0.75
+
+  # ---------------------------------------------------------------------------
+  # `quality>=0.80` is a floor, `prefer: cost` is the tiebreak. Together they
+  # say "do not put a 0.72 model on this, but do not pay Opus prices either" -
+  # and the answer is computed, not typed.
+  #
+  # `escalate_if` is the recovery path of last resort: after the retries and the
+  # fallback chain are spent, re-bind with prefer=quality instead of giving up.
+  - id: implement
+    agent: implementer
+    needs: [judge, gate]
+    retries: 1
+    bind:
+      require: [json_schema, ctx>=128k, quality>=0.80]
+      prefer: cost
+      fallback: [anthropic/*, openai/*, google/*]
+      escalate_if:
+        retries: 1
+        to: quality
+    in:
+      plan: $.world.plan
+      verdict: $.world.verdict
+    out: [patches]
+
+  # ---------------------------------------------------------------------------
+  # Cross-model verification. Note that this constraint is written against
+  # `actual_model` - whatever the previous node ended up on - so it keeps
+  # holding when the implementer was escalated mid-run.
+  - id: verify
+    agent: verifier
+    needs: [implement]
+    bind:
+      require:
+        - json_schema
+        - not_family_of:$.nodes.implement.actual_model
+      prefer: quality
+    in:
+      patches: $.world.patches
+      plan: $.world.plan
+    out: [review]

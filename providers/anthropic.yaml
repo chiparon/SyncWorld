@@ -1,0 +1,20 @@
+# Anthropic's native API is NOT OpenAI-shaped.
+#
+# Rather than hand-writing a second adapter, front it with a translation
+# gateway and point base_url at that. This is the deliberate "do not build a
+# provider zoo" decision: Syncw owns selection and orchestration, not protocol
+# translation.
+#
+#   pip install "litellm[proxy]"
+#   litellm --model anthropic/claude-sonnet-4-5 --port 4000
+#
+# Then export ANTHROPIC_API_KEY (the proxy reads it) and Syncw talks to the
+# proxy as if it were any OpenAI-compatible endpoint.
+
+name: anthropic
+kind: openai-compat
+base_url: http://localhost:4000/v1
+api_key_env: ANTHROPIC_API_KEY
+timeout_ms: 180000
+max_retries: 2
+notes: Expects a LiteLLM (or equivalent) proxy in front of the native API.

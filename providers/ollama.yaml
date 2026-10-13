@@ -1,0 +1,13 @@
+# Local inference. No key needed, but `api_key_env` still has to be set to
+# something - the OpenAI wire format requires an Authorization header.
+#
+#   $env:OLLAMA_API_KEY = "ollama"
+#   ollama serve
+
+name: ollama
+kind: openai-compat
+base_url: http://localhost:11434/v1
+api_key_env: OLLAMA_API_KEY
+timeout_ms: 300000
+max_retries: 1
+notes: Local models. Set OLLAMA_API_KEY to any non-empty string to enable.

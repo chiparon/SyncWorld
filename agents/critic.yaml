@@ -1,0 +1,35 @@
+# The cross-family judge.
+#
+# The workflow is expected to bind this node with
+#   `not_family_of: $.nodes.research.actual_families`
+# so the judge is never from the same lineage as the producers. Same-family
+# review is systematically over-confident, and that bias is measurable.
+
+name: critic
+role: Judge competing findings without favouring your own model lineage.
+
+instructions: |
+  You are the judge for a set of findings produced by other models. You were
+  chosen from a different model lineage on purpose, so that you cannot reward
+  your own family's habits.
+
+  Score each candidate on correctness, specificity, and actionability. Return
+  the index of the best candidate, and your confidence in that judgement as a
+  number between 0 and 1.
+
+  A low-confidence verdict is a valid and useful outcome. If every candidate is
+  weak, say so - do not manufacture agreement to look decisive.
+
+  Judge the content, never the author. You are not told which model produced
+  which finding, and you should not try to infer it.
+
+in:
+  findings:
+    type: json
+    required: true
+
+out:
+  verdict:
+    type: json
+    schema: Verdict
+    required: true

@@ -1,0 +1,142 @@
+# The model capability registry.
+#
+# ILLUSTRATIVE TEMPLATE. Context windows, capabilities, and especially prices
+# move constantly - verify against vendor pricing pages before trusting any
+# number here for budgeting. The *shape* is the point: a model is described by
+# what it can do and what it costs, never by what it should be used for.
+#
+# `quality` is a static prior. In M3 it is overwritten by this project's own
+# eval history, which is the seam where self-tuning routing plugs in.
+
+models:
+  # ---- Anthropic -----------------------------------------------------------
+  - id: anthropic/claude-opus-4-1
+    label: Claude Opus 4.1
+    provider: anthropic
+    family: claude
+    ctx: 200000
+    max_out: 32000
+    caps: [native_tool_calls, parallel_tool_calls, json_schema, reasoning, vision, prompt_caching]
+    cost: { in: 15.00, out: 75.00 }
+    latency_p50_ms: 4200
+    quality: 0.94
+    notes: Expensive. Reserve for work where being wrong costs more than the call.
+
+  - id: anthropic/claude-sonnet-4-5
+    label: Claude Sonnet 4.5
+    provider: anthropic
+    family: claude
+    ctx: 200000
+    max_out: 64000
+    caps: [native_tool_calls, parallel_tool_calls, json_schema, reasoning, vision, prompt_caching]
+    cost: { in: 3.00, out: 15.00 }
+    latency_p50_ms: 2600
+    quality: 0.90
+
+  - id: anthropic/claude-haiku-4-5
+    label: Claude Haiku 4.5
+    provider: anthropic
+    family: claude
+    ctx: 200000
+    max_out: 32000
+    caps: [native_tool_calls, parallel_tool_calls, json_schema, vision, prompt_caching]
+    cost: { in: 1.00, out: 5.00 }
+    latency_p50_ms: 1100
+    quality: 0.78
+    notes: No `reasoning` - a workflow that requires it will route around this model.
+
+  # ---- OpenAI --------------------------------------------------------------
+  - id: openai/gpt-5
+    label: GPT-5
+    provider: openai
+    family: gpt
+    ctx: 400000
+    max_out: 128000
+    caps: [native_tool_calls, parallel_tool_calls, json_schema, reasoning, vision, prompt_caching]
+    cost: { in: 1.25, out: 10.00 }
+    latency_p50_ms: 3800
+    quality: 0.93
+
+  - id: openai/gpt-5-mini
+    label: GPT-5 mini
+    provider: openai
+    family: gpt
+    ctx: 400000
+    max_out: 128000
+    caps: [native_tool_calls, parallel_tool_calls, json_schema, vision, prompt_caching]
+    cost: { in: 0.25, out: 2.00 }
+    latency_p50_ms: 1900
+    quality: 0.80
+
+  # ---- Google --------------------------------------------------------------
+  - id: google/gemini-2-5-pro
+    label: Gemini 2.5 Pro
+    provider: google
+    family: gemini
+    ctx: 1048576
+    max_out: 65536
+    caps: [native_tool_calls, parallel_tool_calls, json_schema, reasoning, vision, prompt_caching]
+    cost: { in: 1.25, out: 10.00 }
+    latency_p50_ms: 3100
+    quality: 0.89
+    notes: Largest context in the registry - wins any ctx>=512k constraint by default.
+
+  - id: google/gemini-2-5-flash
+    label: Gemini 2.5 Flash
+    provider: google
+    family: gemini
+    ctx: 1048576
+    max_out: 65536
+    caps: [native_tool_calls, parallel_tool_calls, json_schema, vision]
+    cost: { in: 0.30, out: 2.50 }
+    latency_p50_ms: 1200
+    quality: 0.79
+
+  # ---- DeepSeek ------------------------------------------------------------
+  - id: deepseek/deepseek-v3-2
+    label: DeepSeek V3.2
+    provider: deepseek
+    family: deepseek
+    ctx: 131072
+    max_out: 8192
+    caps: [native_tool_calls, json_schema, prompt_caching]
+    cost: { in: 0.28, out: 0.42 }
+    latency_p50_ms: 2200
+    quality: 0.87
+    notes: Best quality-per-dollar in the registry. Wins most prefer:cost races.
+
+  - id: deepseek/deepseek-r1
+    label: DeepSeek R1
+    provider: deepseek
+    family: deepseek
+    ctx: 131072
+    max_out: 32768
+    caps: [native_tool_calls, json_schema, reasoning]
+    cost: { in: 0.55, out: 2.19 }
+    latency_p50_ms: 6500
+    quality: 0.86
+    notes: Slow and verbose. Only worth binding with an explicit latency budget.
+
+  # ---- Local (Ollama) ------------------------------------------------------
+  - id: ollama/llama4-maverick
+    label: Llama 4 Maverick (local)
+    provider: ollama
+    family: llama
+    ctx: 1048576
+    max_out: 16384
+    caps: [native_tool_calls, json_schema]
+    cost: { in: 0.00, out: 0.00 }
+    latency_p50_ms: 900
+    quality: 0.72
+    notes: No marginal cost, so it wins every unconstrained prefer:cost race.
+
+  - id: ollama/qwen3-235b
+    label: Qwen3 235B (local)
+    provider: ollama
+    family: qwen
+    ctx: 131072
+    max_out: 16384
+    caps: [native_tool_calls, json_schema, reasoning]
+    cost: { in: 0.00, out: 0.00 }
+    latency_p50_ms: 1400
+    quality: 0.74
