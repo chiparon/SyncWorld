@@ -81,6 +81,19 @@ test('--run can select an empty run', (t) => {
   assert.equal(JSON.parse(result.stdout).run_id, '20261014-130000-empty');
 });
 
+test('--run rejects relative traversal and absolute paths to a valid sibling run', (t) => {
+  const { runsDir, agents, invoke } = fixture(t);
+  const sibling = join(dirname(runsDir), 'outside');
+  mkdirSync(sibling);
+  writeFileSync(join(sibling, 'agents.json'), JSON.stringify(agents));
+  for (const runId of ['../outside', '..\\outside', sibling]) {
+    const result = invoke(['status', '--run', runId, '--json']);
+    assert.equal(result.status, 1);
+    assert.equal(result.stdout, '');
+    assert.match(result.stderr, /Unknown run.*Choose an existing run id/);
+  }
+});
+
 test('no runs exits one with one actionable message on stderr', (t) => {
   const { runsDir, invoke } = fixture(t, false);
   const result = invoke(['status']);
@@ -100,6 +113,7 @@ test('unknown options, subcommands, run ids and missing option values fail witho
     assert.match(result.stderr, /--help|Choose an existing run id/);
     assert.equal(result.stderr.trim().split('\n').length, 1);
     assert.doesNotMatch(result.stderr, /\bat .*\.ts:/);
+    assert.doesNotMatch(result.stderr, /\.\. Run syncw --help/);
   }
 });
 

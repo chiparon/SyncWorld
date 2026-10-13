@@ -101,6 +101,7 @@ test('no eligible run names the directory, including a missing directory, withou
   run('empty', []);
   run('old');
   for (const directory of [runsDir, join(runsDir, 'missing')]) {
+    assert.equal(findLatestRun(directory), undefined);
     assert.throws(() => readRunStatus({ runsDir: directory }), (error: Error) => {
       assert.ok(error.message.includes(directory));
       assert.match(error.message, /No run with agents.*Start a Syncw run/);
@@ -108,6 +109,17 @@ test('no eligible run names the directory, including a missing directory, withou
     });
   }
   assert.equal(existsSync(join(runsDir, 'missing')), false);
+});
+
+test('latest-run selection throws when the runs path exists but cannot be read as a directory', (t) => {
+  const { runsDir } = fixture(t);
+  const file = join(runsDir, 'file');
+  writeFileSync(file, 'not a directory');
+  assert.throws(() => findLatestRun(file), (error: Error) => {
+    assert.ok(error.message.includes(file));
+    assert.match(error.message, /Cannot read runs directory.*Check/);
+    return true;
+  });
 });
 
 test('unknown explicit runs are rejected; a selected legacy run reports its missing agents file', (t) => {
@@ -132,6 +144,7 @@ for (const problem of ['unreadable', 'invalid JSON', 'not an array'] as const) {
     // A directory at the file path is unreadable as a file on every supported platform.
     if (problem === 'unreadable') mkdirSync(file);
     else writeFileSync(file, problem === 'invalid JSON' ? '{' : '{}');
+    assert.throws(() => findLatestRun(runsDir));
     for (const runId of [undefined, 'z-broken']) {
       assert.throws(() => readRunStatus({ runsDir, runId }), (error: Error) => {
         assert.ok(error.message.includes(file));
@@ -141,3 +154,28 @@ for (const problem of ['unreadable', 'invalid JSON', 'not an array'] as const) {
     }
   });
 }
+
+test('malformed records name the file, zero-based record index and invalid field', (t) => {
+  const { runsDir, run } = fixture(t);
+  run('a-older', [agent()]);
+  const file = join(run('z-broken'), 'agents.json');
+  const cases: [unknown, string][] = [[null, 'name'], [{}, 'name']];
+  for (const field of ['name', 'role', 'status', 'branch', 'turns', 'queued_messages']) {
+    cases.push([{ ...agent(), [field]: 42 }, field]);
+    cases.push([{ ...agent(), [field]: undefined }, field]);
+  }
+  for (const task of [undefined, null, {}, { goal: 42 }]) {
+    cases.push([{ ...agent(), task }, 'task.goal']);
+  }
+  for (const [record, field] of cases) {
+    writeFileSync(file, JSON.stringify([agent(), record]));
+    for (const runId of [undefined, 'z-broken']) {
+      assert.throws(() => readRunStatus({ runsDir, runId }), (error: Error) => {
+        assert.ok(error.message.includes(file));
+        assert.ok(error.message.includes(`field "${field}"`));
+        assert.match(error.message, /record index 1.*Repair or restore agents.json/);
+        return true;
+      });
+    }
+  }
+});

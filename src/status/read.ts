@@ -27,20 +27,33 @@ function readAgents(file: string, allowMissing = false): AgentRecord[] | undefin
   if (!Array.isArray(records)) {
     throw new Error(`Expected an array in "${file}". Repair or restore agents.json as an array of agents.`);
   }
+  for (const [index, value] of (records as unknown[]).entries()) {
+    const record = value !== null && typeof value === 'object' ? value as Record<string, unknown> : {};
+    const invalidField = (field: string, expected: string) => new Error(
+      `Invalid field "${field}" at record index ${index} in "${file}": expected ${expected}. Repair or restore agents.json before retrying.`,
+    );
+    for (const field of ['name', 'role', 'status', 'branch']) {
+      if (typeof record[field] !== 'string') throw invalidField(field, 'a string');
+    }
+    const task = record.task;
+    if (task === null || typeof task !== 'object' || !('goal' in task) || typeof task.goal !== 'string') {
+      throw invalidField('task.goal', 'a string');
+    }
+    for (const field of ['turns', 'queued_messages']) {
+      if (!Array.isArray(record[field])) throw invalidField(field, 'an array');
+    }
+  }
   return records as AgentRecord[];
 }
 
 /** Ignore empty health-check runs and old runs, but surface broken state files. */
-export function findLatestRun(runsDir: string): string {
+export function findLatestRun(runsDir: string): string | undefined {
   const directory = resolve(runsDir);
-  const noRun = () => new Error(
-    `No run with agents in "${directory}". Start a Syncw run and hire an agent, or set SYNCW_RUNS_DIR to an existing runs directory.`,
-  );
   let entries;
   try {
     entries = readdirSync(directory, { withFileTypes: true });
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') throw noRun();
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
     throw new Error(`Cannot read runs directory "${directory}". Check its permissions or set SYNCW_RUNS_DIR to a readable directory.`);
   }
   const names = entries.filter((entry) => entry.isDirectory()).map((entry) => entry.name).sort().reverse();
@@ -48,12 +61,17 @@ export function findLatestRun(runsDir: string): string {
     const agents = readAgents(join(directory, name, 'agents.json'), true);
     if (agents && agents.length > 0) return name;
   }
-  throw noRun();
+  return undefined;
 }
 
 export function readRunStatus(opts: ReadStatusOptions): RunStatus {
   const runsDir = resolve(opts.runsDir);
   const runId = opts.runId ?? findLatestRun(runsDir);
+  if (runId === undefined) {
+    throw new Error(
+      `No run with agents in "${runsDir}". Start a Syncw run and hire an agent, or set SYNCW_RUNS_DIR to an existing runs directory.`,
+    );
+  }
   const runDir = join(runsDir, runId);
   if (opts.runId !== undefined) {
     const unknownRun = () => new Error(

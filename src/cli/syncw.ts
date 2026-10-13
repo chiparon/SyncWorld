@@ -28,7 +28,8 @@ export function readOptions(args = process.argv.slice(2), env: NodeJS.ProcessEnv
       allowPositionals: true,
     });
   } catch (error) {
-    throw new Error(`${error instanceof Error ? error.message : String(error)}. Run syncw --help for usage.`);
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`${message.replace(/\.$/, '')}. Run syncw --help for usage.`);
   }
   const { values, positionals } = parsed;
   if (positionals.length > 1 || (positionals.length === 1 && positionals[0] !== 'status')) {
