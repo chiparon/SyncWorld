@@ -20,6 +20,7 @@ Syncw is a post office for AI agents: a Claude scheduler hires Codex workers, ea
 ## Environment
 
 - Windows 11 with PowerShell. Use `node:path` for paths, because they may contain backslashes.
+- A new worktree has no `node_modules`, because it is gitignored. Run `npm ci` once before `npm run typecheck` or `npm test`.
 - To run a Node script from code, spawn `process.execPath` with the script path. Do not go through a shell or `.cmd` shims.
 - Command output may be GBK-encoded. Never parse human-readable command output when a structured alternative exists.
 

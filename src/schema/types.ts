@@ -368,6 +368,47 @@ export interface PostOffice {
 }
 
 // ---------------------------------------------------------------------------
+// Status: what `syncw status` shows a human about one run (DESIGN §8).
+// src/status/read.ts builds it from runs/<run-id>/ on disk, and
+// src/status/format.ts turns it into text. Both only read: the command never
+// changes a run, and it works whether or not a post office is running.
+// ---------------------------------------------------------------------------
+
+/** One agent as `syncw status` shows it. */
+export interface AgentStatusView {
+  name: string;
+  role: string;
+  status: AgentStatus;
+  branch: string;
+  /** task.goal, verbatim; it may span several lines. */
+  goal: string;
+  /** Finished turns. */
+  turns: number;
+  queued_messages: number;
+  /** Only while running: seconds since the current turn started. Absent when unknown. */
+  running_for_s?: number;
+  /** The last finished turn. Absent until the first turn finishes. */
+  last_turn?: Pick<TurnRecord, 'result' | 'facts'>;
+}
+
+export interface RunStatus {
+  run_id: string;
+  /** Absolute path of runs/<run-id>. */
+  run_dir: string;
+  /** In hiring order, as in agents.json. */
+  agents: AgentStatusView[];
+}
+
+export interface StatusFormatOptions {
+  /**
+   * Terminal width in columns. When set, no line may be wider, counting East
+   * Asian wide characters (such as Chinese) as two columns. When absent, for
+   * example because the output is piped, nothing is cut.
+   */
+  width?: number;
+}
+
+// ---------------------------------------------------------------------------
 // Board (milestone 2). Used by src/runtime/world.ts, kept from M0.
 // ---------------------------------------------------------------------------
 
