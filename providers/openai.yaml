@@ -1,6 +1,0 @@
-name: openai
-kind: openai-compat
-base_url: https://api.openai.com/v1
-api_key_env: OPENAI_API_KEY
-timeout_ms: 180000
-max_retries: 3

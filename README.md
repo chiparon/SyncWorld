@@ -1,155 +1,106 @@
 # Syncw
 
-**Synchronized World** — a declarative orchestration layer where **agent behaviour, provider access, and model capability are three orthogonal, hot-swappable registries.**
-
-You write who does what and under which policy. Syncw resolves *which model* at runtime, records why, and lets you replay the whole run on different models and see exactly what changed.
-
-> ### 📐 Where this is going
->
-> M0 (everything in this README, runnable today) treats an "agent" as a *prompt + output contract* executed as one model call.
->
-> The target architecture treats an "agent" as **an existing agent application** — Codex CLI, Claude Code — driven as a long-running session, with a planner in one and an executor in the other.
->
-> That design is written up in **[docs/AGENT-MESH.md](docs/AGENT-MESH.md)**: a driver layer that survives minor CLI updates (capability contract + fingerprint drift detection + conformance probe), coordination over git/issue/chat rather than a bespoke scheduler, and a `TaskPackage` / `RunResult` handoff protocol.
->
-> It also documents, honestly, which parts of M0 **do not survive** the change — most notably the content-addressed cache, which is unsound when a "call" mutates a filesystem.
-
-```yaml
-- id: implement
-  agent: implementer              # behaviour — contains no model
-  bind:                           # a query over model space, not an assignment
-    require: [json_schema, ctx>=128k, quality>=0.80]
-    prefer: cost
-    escalate_if: { retries: 1, to: quality }
-```
-
-```yaml
-- id: verify
-  agent: verifier
-  bind:
-    require:
-      - json_schema
-      - not_family_of:$.nodes.implement.actual_model   # different lineage than the author
-    prefer: quality
-```
-
-Nothing above names a model. The second example constrains against **whatever the implementer actually ran on**, which stays correct even when that was chosen at runtime by a cost policy — or changed mid-run by an escalation.
-
----
-
-## Quick start
-
-Requires Node ≥ 22.18 (native TypeScript — no build step).
-
-```bash
-npm install
-npm run demo        # end-to-end story, no API keys, 7 self-checks
-npm run verify      # typecheck + 75 tests + demo
-```
-
-**No API keys needed.** With no credentials present, Syncw routes every model through an offline synthesiser and tells you it did. The capability registry, binding policy, caching, replay and diff all behave identically — only the wire is substituted.
-
-```bash
-node src/cli.ts run feature-dev      # six nodes, plan → research → judge → gate → implement → verify
-node src/cli.ts bind feature-dev --explain   # resolve every binding without calling anything
-```
-
-The test suite covers the parts that are easy to get subtly wrong: merge semantics and ownership enforcement, the safety/resource constraint split, fallback refuse-to-violate behaviour, the retry → fallback → escalate ordering, join arithmetic under partial failure, and cache accounting.
-
----
-
-## The command worth learning
-
-```bash
-node src/cli.ts replay <runId> --swap research=openai/gpt-5
-```
-
-Swap **one** node's model, re-run, and diff. Untouched nodes are served byte-identically from the content-addressed cache, so the diff isolates your change.
-
-Here is the real output of that command:
+**Synchronized World**：一个给 AI agent 用的 post office。Claude 当 scheduler，负责拆任务、写任务说明、审查和拍板；Codex worker 负责干活，每个 worker 在自己的 git worktree 里工作；两者之间通过一个 MCP server 通信。
 
 ```
-  node         model                                                B source  cost A   cost B   Δcost
-  = plan       anthropic/claude-opus-4-1                            cached    $0.0229  $0.0000  -$0.0229
-  ~ research   anthropic/claude-sonnet-4-5 → openai/gpt-5           cached    $0.0121  $0.0060  -$0.0062
-  ~ judge      deepseek/deepseek-v3-2 → anthropic/claude-opus-4-1   live      $0.0003  $0.0154  +$0.0151
-  ~ implement  deepseek/deepseek-v3-2                               live      $0.0002  $0.0002  =
-  ~ verify     anthropic/claude-opus-4-1                            live      $0.0146  $0.0130  -$0.0016
-
-  total                                       $0.0500 → $0.0345   -31%   ← not comparable
-  like-for-like, over the 3 nodes that made a live call in B:
-                                              $0.0150 → $0.0286   +91%
+你
+ -> Claude Code 会话 = scheduler：拆任务、写任务说明、拍板
+      通过 post office（MCP server）派活、收结果
+      -> Codex worker 1：在自己的 git worktree 和分支上干活
+      -> Codex worker 2：同上，可以并行
+ -> verifier = Claude Code subagent：审 diff、跑测试，只汇报不修改
 ```
 
-You changed `research`. **`judge` re-bound itself** — because `research`'s `actual_families` collapsed from `{claude, gpt, gemini}` to `{gpt}`, so Claude became the highest-quality model outside the producers' lineage. A node nobody edited got **59× more expensive**, its confidence fell from 0.84 to 0.59, which fired a human gate that had previously been skipped, and the verdict flipped from `passed: false` to `passed: true`.
+这样分工是因为：Claude 判断力强，但按 token 计费，所以只用来做判断；GPT 通过你的 ChatGPT 订阅使用 Codex，额度充足，所以负责执行。GPT 写、Claude 审，同时也是不同模型家族之间的交叉检查。
 
-And note the two totals. Cached nodes cost nothing, so the bottom line *fell* 31% while the work that actually ran got **91% more expensive**. Read the bottom line and you conclude the opposite of the truth.
+完整设计见 **[docs/DESIGN.md](docs/DESIGN.md)**。
 
-> In a cross-model pipeline you cannot reason about cost or behaviour node by node.
-> The chronicle is the only thing that tells you the truth.
+## 状态
 
-Run `npm run demo` to reproduce this end to end, with an automated verdict at the end.
+milestone 1 的代码已经完成：post office、Codex 引擎、MCP server、角色模板、verifier，以及查看团队现状的 `syncw status` 命令。共 135 个测试：134 个通过，1 个要用真的 Codex，默认跳过。
 
----
+验收场景（[DESIGN §2](docs/DESIGN.md)）已经在真实的 Claude Code 会话里跑通，用的任务就是 `syncw status` 命令本身：scheduler 先写好合同，再雇 2 个 Codex worker 并行开工；verifier 分别审查，各提出了问题；scheduler 用 `send_message` 让原来的 worker 在原会话里修改；最后合并两个分支。
 
-## Commands
+milestone 1 的代码本身就是用这套方式造出来的：Claude 先写好"合同"（`src/schema/types.ts`），再把实现派给 4 个 Codex worker 并行完成，审查通过后合并。
 
-| | |
+## 准备
+
+- Node ≥ 22.18（原生运行 TypeScript，不需要构建）
+- git
+- Codex CLI，并用 ChatGPT 账号登录：运行 `codex login status`，应该显示 `Logged in using ChatGPT`
+- Claude Code
+
+```powershell
+cd E:\Eproject\Syncw
+npm ci
+npm run verify          # 类型检查 + 全部测试
+```
+
+## 接入 Claude Code
+
+只在当前项目里注册（local 作用域）：
+
+```powershell
+cd E:\Eproject\Syncw
+claude mcp add --scope local syncw -- node E:\Eproject\Syncw\src\postoffice\main.ts
+```
+
+注册后要重启 Claude Code，新工具才会加载。worker 默认在 Claude Code 当前所在的仓库里干活；用 `--repo <路径>` 可以指定其他仓库。
+
+verifier subagent 放在 `.claude/agents/verifier.md`，在这个项目里自动可用。
+
+## 用法
+
+在 Claude Code 里直接交代任务就行。scheduler 会自己调用这些工具：
+
+| 工具 | 作用 |
 |---|---|
-| `syncw models` | the model capability registry |
-| `syncw providers` | which providers this machine can actually reach |
-| `syncw bind <workflow> [--explain]` | resolve every binding **without calling a model** |
-| `syncw run <workflow>` | execute |
-| `syncw runs` / `show <runId>` | run history and summaries |
-| `syncw explain <runId> [--explain]` | every binding decision that run made, candidates included |
-| `syncw replay <runId> [--set node=model]` | re-run the same inputs on different models |
-| `syncw diff <runA> <runB>` | node-by-node comparison |
+| `spawn_agent` | 雇一个 Codex worker，立即返回，不等它干完 |
+| `wait` | 收结果，每一轮只汇报一次 |
+| `send_message` | 给 worker 发后续要求，worker 记得之前的工作 |
+| `list_agents` | 查看团队现状 |
+| `cancel_agent` | 中止一个 worker |
+| `close_agent` | 合并之后删除 worker 的 worktree |
 
-Useful flags: `--input k=v`, `--offline`, `--all-providers`, `--fresh`, `--yes`, `--mock-fail '<glob>'`.
+worker 的角色可以套用 `roles/` 里的模板（`engineer`、`architect`、`researcher`），也可以由 scheduler 现场写。
 
----
+## 去哪里看
 
-## Repository layout
+- `npm run status`：最近一次运行的团队现状，包括每个 agent 的角色、状态、轮数、最近一次结果和任务目标。还没雇人的空运行会被跳过。它只读取磁盘上的记录，所以 post office 没在运行时也能用。`npm run status -- --run <运行 id>` 查看指定的一次运行，`npm run status -- --json` 输出原始数据。
+- `runs/<运行 id>/agents.json`：所有 agent 的状态
+- `runs/<运行 id>/<agent>/`：每一轮的 prompt、结果，以及 Codex 的完整事件流
+- git 分支 `syncw/<agent>`：每一轮的工作都会自动 commit，作者是 `<agent> (syncw)`
+- worktree：在仓库旁边的 `<仓库名>.worktrees/<agent>/` 目录里
 
-```
-agents/       behaviour specs — model-free by construction
-models/       capability profiles (ctx, caps, cost, latency, quality prior)
-providers/    endpoints + credentials
-workflows/    the DSL: topology + binding policy + world schema
-runs/         the chronicle (gitignored)
-src/
-  schema/     types + YAML loading/validation
-  runtime/
-    binding.ts       the binding policy engine  <- the core
-    requirements.ts  the constraint language (safety vs resource)
-    world.ts         shared state + merge semantics
-    engine.ts        DAG scheduler, fan-out, join, budget, recovery
-    cache.ts         content-addressed call cache
-    trace.ts         the chronicle
-  providers/  mock (offline) + openai-compat
-  report.ts   binding plans, run summaries, replay diff
-docs/DESIGN.md   full design document — read this next
-```
+## 配置
 
----
+| 环境变量 | 默认值 | 作用 |
+|---|---|---|
+| `SYNCW_MAX_PARALLEL` | 4 | 同时运行的 worker 数 |
+| `SYNCW_MAX_AGENTS` | 12 | 一次运行最多雇多少个 worker |
+| `SYNCW_MAX_TURNS` | 10 | 每个 worker 最多跑几轮 |
+| `SYNCW_TURN_TIMEOUT_MS` | 1800000 | 单轮超时（30 分钟） |
+| `SYNCW_RUNS_DIR` | `runs/` | 运行记录放在哪里 |
+| `SYNCW_CODEX_COMMAND` | 自动查找 | 启动 codex 的命令，格式是 JSON 数组 |
 
-## Using real models
+启动参数 `--reopen` 会接着上一次运行：之前正在跑的 worker 会被标记为"中断"，之后可以用 `send_message` 续接。
 
-Set a key and Syncw uses it automatically; `syncw providers` shows the routing.
+## 安全
 
-```bash
-export DEEPSEEK_API_KEY=...     # or OPENAI_API_KEY / GEMINI_API_KEY / OPENROUTER_API_KEY
-node src/cli.ts providers
-```
+worker **不加沙箱**，这和你平时用 Codex 的方式一致，所以理论上它们能改电脑上的任何文件。兜底措施：
+- 每个 worker 独占一个 worktree 和分支；
+- 每一轮都自动 commit；
+- 没有经过审查的东西一律不合并；
+- 所有事件都记在日志里。
 
-Anthropic's native API is not OpenAI-shaped, and Syncw deliberately does **not** ship a second adapter for it — front it with a translation gateway and point `base_url` at that. See `providers/anthropic.yaml`.
+详见 [DESIGN.md §7](docs/DESIGN.md)。
 
----
+## 开发
 
-## What this is not
+- 测试用 `test/fake-codex/` 里的假 codex，不会调用真的 Codex。
+- `SYNCW_REAL_CODEX=1 npm test` 会额外用真的 Codex 跑一个集成测试。这个测试会在 `~/.codex/config.toml` 里留下一条临时仓库的信任记录，可以手动删掉。
+- 代码规范见 [AGENTS.md](AGENTS.md)，每个 Codex worker 都会自动读取它。
 
-- Not a provider gateway. That problem is solved (LiteLLM, OpenRouter); Syncw owns selection and orchestration. Tools go through MCP, cross-process agents through A2A.
-- Not a visual builder. The DSL is the source of truth; a UI would be a projection of it.
-- Not a code-first graph library. Orchestration is **data** — that is precisely what makes replay, diff, and (next) self-tuning routing possible.
+## 历史
 
-**M0 status:** the engine, world state, binding policy, chronicle, cache and replay/diff are implemented and runnable. Evaluation-driven routing is the next milestone — see [docs/DESIGN.md](docs/DESIGN.md) §9.
+M0 是 DeepSeek 写的一个模型路由流水线，它误解了项目目标。M0 保存在 git tag `m0-deepseek`，可以用 `git show m0-deepseek:README.md` 查看。

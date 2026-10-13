@@ -1,340 +1,262 @@
-# Syncw 设计文档（M0）
+# Syncw 设计（v3）
 
-> **状态：M0 快照。** 本文描述的实现真实存在、可运行、有测试覆盖（[`npm run verify`](../package.json)）。
+> **状态：milestone 1 已经实现，第 2 节的验收场景已经跑通（2026-10-14）。**
 >
-> 但**目标架构已经演进**：M0 把 "agent" 建模为「prompt + 输出契约」，而目标是把 "agent" 建模为**已有的 agent 软件**（Codex CLI、Claude Code）的长期会话。
-> 新方向见 **[AGENT-MESH.md](AGENT-MESH.md)**，其中也列出了本文哪些部分在迁移中会失效（§6 遗产清单，特别是内容寻址缓存）。
->
-> 阅读顺序建议：先本文 §3.2（安全/资源约束分离）与 §6（级联效应实测），这两条在演进后依然成立。
-
-> **Syncw = Synchronized World。**
-> 名字取自 Dune 的 Omnius——但 Omnius 的本质从来不是"一个超级 AI"，
-> 而是**一份被所有子代理共享的世界态，加一套让它们保持同步的协议**。
-> 这份文档的每一节都在把这句话翻译成工程结构。
+> 本文取代 v2 草稿和 M0 的文档。v2 设想用 DeepSeek 自建 agent 循环，从未提交。M0 是 DeepSeek 写的模型路由流水线，保存在 git tag `m0-deepseek`。旧文档可以这样查看：`git show m0-deepseek:docs/DESIGN.md`、`git show m0-deepseek:docs/AGENT-MESH.md`。
 
 ---
 
-## 0. 一句话论点
+## 1. 目标
 
-> **编排是数据（DSL），执行是引擎（Runtime），绑定是策略（Binding Policy）。**
+Syncw 让多个 AI agent 像一个小公司一样协作：
 
-Agent 只描述**做什么**（角色、指令、IO 契约），**不含模型**；谁来做，由运行时根据策略在模型空间里查询决定。
+- **伙伴（partner）**：agent 之间互相发消息，可以讨论、反对，最后达成一致。
+- **员工（employee）**：一个 agent 可以雇一个新 agent，给它一份岗位说明和一个任务，也就是 prompt。新 agent 干完活后汇报结果。
+- **角色（role）**：scheduler 和 verifier 是固定角色，其他角色由雇主在雇人时现场定义。
 
-这条论点有一个可证伪的验收标准：
+**资源策略**：按各家模型的长处和成本分工。
 
-> **任何节点的 provider + model 都能换掉，而不用改 agent 的 prompt，也不用改工作流的拓扑。做不到，就是抽象漏了。**
+- **Claude** 判断力强，但走 API 按量计费，所以只做判断：拆任务、写任务说明、审查、拍板，token 尽量少用。
+- **GPT** 通过 Codex CLI 使用你的 ChatGPT 订阅，执行能力强，额度也充足，所以负责执行：读代码、写代码、跑测试、反复修改。
+- **DeepSeek** 以后作为便宜的补充。
 
-M0 的代码全部围绕这一条展开，其余功能都是它的推论。
+这样分工还有一个额外的好处：GPT 写、Claude 审，天然就是不同模型家族之间的交叉检查。
 
----
-
-## 1. 三个正交注册表
-
-| 注册表 | 目录 | 内容 | 变更频率 |
-|---|---|---|---|
-| **行为** | `agents/` | role、instructions、工具授权、`in`/`out` 契约 | 低 |
-| **接入** | `providers/` | 凭证、endpoint、限流、重试 | 中 |
-| **能力** | `models/` | 上下文窗口、capability、$/Mtok、p50 延迟、quality 先验 | **高**（每周都在变） |
-| **编排** | `workflows/` | 拓扑 + 绑定策略 + 世界态 schema + 失败语义 | 中 |
-| **证据** | `runs/` | 编年史（完整 trace），可重放、可 diff | 每次运行 |
-
-三者的交叉引用为零：`AgentSpec` 里没有 `model` 字段，`ProviderConfig` 里没有模型列表，`ModelProfile` 里没有 prompt。
-
-`models/` 是最被低估的一层。**模型的能力画像是会过期的**——价格、上下文、是否支持 JSON Schema、tool-call 风格，几个月就变一轮。把它做成独立可编辑的注册表，而不是散落在各处的 `if model == "claude"`，是让整个系统可维护的前提。
+**暂不考虑**：图形界面、跨机器运行，以及自动选模型（M0 的 binding 引擎）。
 
 ---
 
-## 2. 世界态：把 "Synchronized" 变成技术主张
+## 2. 全景
 
-现有框架几乎都只在**边上传递消息**，没有共享状态。这恰好是多代理系统的崩溃点：并发写互相覆盖、上下文每次跳转被有损摘要、无法回滚到干净点。
-
-Syncw 把 **World State 做成一等公民**——带类型的黑板，每个字段声明**合并语义**和**属主**：
-
-```yaml
-world:
-  plan:
-    type: json
-    merge: replace
-    owner: plan          # 只有 plan 节点能写；别人写就报错
-
-  findings:
-    type: json
-    merge: append        # 三个并发 researcher 各追加一条，安全
-
-  verdict:
-    type: json
-    merge: replace
-    owner: judge
+```
+你
+ -> Claude Code 会话 = scheduler：拆任务、写任务说明、拍板
+      通过 post office（一个 MCP server）派活、收结果
+      -> Codex worker 1：在自己的 git worktree 里干活
+      -> Codex worker 2：同上，可以并行
+      -> ……
+ -> verifier = Claude Code 的 subagent：审 diff、跑测试，只汇报，不修改
 ```
 
-六种合并策略：`replace` / `append` / `last_write_wins` / `first_write_wins` / `sum` / `max`。
+milestone 1 的验收场景：
 
-两个被刻意实现的细节：
-
-- **`owner:` 是强制执行的，不是文档。** 越权写入抛 `WorldOwnershipError`。并发代理静默污染状态是这类系统最难查的 bug。
-- **`replace` 在检测到第二个写入者时会记录 conflict。** 它的语义是"我认为只有我在写"；如果这个假设被打破，你应该知道。想表达"允许覆盖"就用 `last_write_wins`。
-
-一旦有了它，**并行 fan-out 的正确性、断点续跑、局部重算、非线性打回重做**全都免费得到。
+1. 你给 scheduler 一个真实的开发任务。
+2. scheduler 把任务拆成两块，调用 `spawn_agent` 雇两个 Codex worker 并行开工。
+3. 两个 worker 各自在自己的 worktree 和分支上完成工作，并按固定格式返回结果。
+4. scheduler 让 verifier 审查每个 worker 的 diff，并跑测试。
+5. verifier 发现一个问题，scheduler 用 `send_message` 让对应的 worker 修改。这一步续接的是 worker 原来的会话，它记得之前做过什么。
+6. 全部通过后，scheduler 合并两个分支。
 
 ---
 
-## 3. 绑定策略引擎（核心）
+## 3. 概念
 
-这是整个项目里别处没有的东西，也是 `src/runtime/binding.ts` 的全部内容。
+| 术语 | 含义 |
+|---|---|
+| **Agent** | 有名字的工作者，比如 `engineer-1`。它有自己的角色和会话历史，会话历史就是它的记忆。 |
+| **引擎（engine）** | 驱动 agent 的软件。milestone 1 里，scheduler 和 verifier 用 Claude Code，worker 用 Codex。以后可以加 DeepSeek。 |
+| **角色（role）** | 岗位说明：做什么、怎么做、要注意什么。scheduler 和 verifier 是固定角色；worker 的角色由雇主现场写，或者套用 `roles/` 里的模板。 |
+| **任务（task）** | 雇人时交代的活，包括目标、验收标准、约束和背景资料。 |
+| **结果（result）** | worker 每一轮结束时按固定格式返回的汇报，包括状态、摘要、细节、改了哪些文件，以及还没解决的问题。 |
+| **Post office** | 一个 MCP server，是普通代码，不是 AI。它负责雇人（启动 worker）、转发消息、收结果、管理 worktree，记录所有事件，并执行各项限制。 |
+| **Worktree** | 每个 worker 独占一个 git worktree 和一个分支，互不干扰。 |
+| **公告板（board）** | 存放共享的关键决定，比如接口和数据格式，所有 agent 都读同一份。来自 M0 的 `world.ts`。*（milestone 2）* |
 
-**输入**：一个对模型空间的*查询* + 当前世界态。
-**输出**：一个具体的模型，加上一份完整的、可审计的决策说明。
+---
 
-### 3.1 解析顺序
+## 4. 角色
 
-```
-1. pin        绝对人工覆盖。刻意绕过 require:，并在 trace 里注明——
-              一个"默默遵守约束"的 pin 是你没法用来 debug 的 pin。
-2. by_index   异构 fan-out，第 i 个 item 交给不同厂商。同样显式、同样绕过约束。
-3. require / prefer   常规路径：先用硬约束过滤，再排序。
-4. fallback   按顺序尝试的 glob 链。见 3.2，这里有一条关键的设计线。
-```
+**固定角色**：都需要判断力，由 Claude 担任。
 
-### 3.2 安全约束 vs 资源约束（本设计最重要的一条线）
-
-`fallback:` 到底该不该绕过硬约束？两边都说得通，但放任它绕过会出人命：
-
-```yaml
-require:
-  - not_family_of:$.nodes.research.actual_families   # 评委不能和生产者同族
-fallback: [deepseek/*, google/*]
-```
-
-如果 fallback 可以绕过硬约束，那么"同族自评"这条防线会在系统承压时**静默失效**——而这恰恰是最需要它的时候。
-
-所以约束被分成两类，由引擎强制：
-
-| 类别 | 成员 | 能否被 `fallback` 降级 |
+| 角色 | 由谁担任 | 职责 |
 |---|---|---|
-| **SAFETY 安全约束** | `not_family_of` / `not_same_as` / `provider:` / `family:` | **永不** |
-| **RESOURCE 资源约束** | capability 存在性、`ctx` / `cost` / `quality` / `latency` 数值比较 | 可以 |
+| **scheduler** | 你正在对话的 Claude Code 会话 | 理解你的目标，拆成任务，写任务说明，雇 worker，看结果，决定下一步，合并成果，向你汇报。它只负责协调，自己不写大量代码。 |
+| **verifier** | Claude Code 的 subagent（`.claude/agents/verifier.md`） | 审查别人写的东西：读 diff、跑测试、对照验收标准。审查结论要么是 `APPROVED`，要么列出具体问题。它不修改代码。 |
 
-一句话：**安全约束不可降级，资源约束可降级。** 上下文窗口小一点是更差的结果，不是错误的结果；同族自评是错误的结果。
+**现场定义的角色**：scheduler 雇人时有两种方式：
+- 套用 `roles/` 里的模板，比如 `engineer`、`architect`、`researcher`；
+- 直接写一段专门为这个任务定制的岗位说明（brief）。
 
-这不是约定，是 `src/runtime/requirements.ts` 里 `RequirementKind` 的类型系统保证。
-
-### 3.3 可解释性是硬需求
-
-引擎会评估**注册表里的每一个模型**并记录落选原因，不只是选出赢家：
-
-```
-judge
-  → ollama/qwen3-235b [item 0] via policy
-      · declared `fallback:` [deepseek/*, google/*, openai/*] could not be honoured
-        without violating a SAFETY constraint, so the general policy was re-resolved
-      · selected by policy: prefer=quality
-      · constraints: json_schema AND not_family_of:$.nodes.research.actual_families
-      · 2/11 models satisfied the constraints
-      · beat ollama/llama4-maverick on quality score (0.740 vs 0.720)
-```
-
-**你无法审计的绑定决策，你不敢让它上生产。** 这份输出由 `syncw explain <runId>` 直接读取 trace 生成。
-
-注意上面这段真实输出：fallback 链因为会违反安全约束而**无法被满足**时，引擎改走通用策略（仍然强制安全约束），并且**如实说明它没有遵守你写的 fallback 链**。静默替换比报错危险得多。
-
-### 3.4 `$.nodes.<id>.actual_model` ——让跨模型约束可声明
-
-`not_family_of: $.nodes.implement.actual_model` 里的目标，是**上一个节点实际跑在哪个模型上**，而不是你在文件里写了什么。
-
-这一点至关重要：implement 节点的模型是运行时按 `prefer: cost` + `quality>=0.80` 算出来的，甚至可能在失败后被 escalate 换成另一个。约束依然成立。
-
-同理 `actual_families`（复数）在 fan-out 场景下是**实际用到的所有族**的列表。M0 开发过程中这里暴露过一个真实 bug：当 fan-out 恰好坍缩到单一模型时，`actual_families` 曾经不存在，导致下游 `not_family_of` 引用失败并被误报成"没有模型满足约束"。修复方式是**无论异构与否都恒定暴露数组**——异构性是运行时的属性，不是集合基数的属性。
+**权限规则**：被雇的 agent，权限不能超过雇主。milestone 1 里 worker 还不能雇人；到 milestone 2 开放 worker 雇人时，这条规则开始生效。
 
 ---
 
-## 4. DSL 参考
+## 5. Post office 的工具
+
+scheduler 通过 MCP 调用下面这些工具。
+
+| 工具 | 作用 |
+|---|---|
+| `spawn_agent(task, role?, brief?, repo?, base?)` | 雇一个 Codex worker：创建 worktree 和分支，启动 worker，然后立即返回它的名字（比如 `engineer-1`）、分支和 worktree 路径，不等它干完。`repo` 指定在哪个仓库里干活，默认是 post office 的当前目录。 |
+| `send_message(to, text)` | 给 worker 发后续消息。worker 空闲时，会马上开始新的一轮（续接原来的会话）；正在干活时，消息先排队，等这一轮结束再送达。 |
+| `wait(agents?, timeout_s?)` | 等结果：返回已经完成的那一轮结果；超时就返回"还在运行"。 |
+| `list_agents()` | 团队现状：名字、角色、状态、分支、用时，以及最近一次结果的摘要。 |
+| `cancel_agent(name)` | 中止正在运行的 worker。 |
+| `close_agent(name, delete_branch?)` | 收尾：合并之后或者放弃时，删除 worker 的 worktree。 |
+
+**任务格式**（`spawn_agent` 的 `task` 参数）：
 
 ```yaml
-name: feature-dev
-input:
-  goal: { type: string, required: true, default: "..." }
-budget: { max_usd: 5.00 }
-
-world: { ... }                          # 见 §2
-
-nodes:
-  - id: plan
-    agent: planner                      # 行为，与模型无关
-    bind:                               # 查询，不是赋值
-      require: [json_schema, ctx>=200k]
-      prefer: quality
-      fallback: [deepseek/*, google/*]
-    in:  { goal: $.input.goal }
-    out: [plan]                         # world 字段 <- 契约字段（同名可简写）
-
-  - id: research
-    agent: researcher
-    needs: [plan]
-    for_each: $.world.plan.steps        # fan-out；item 在节点内以 `$` 引用
-    join: all                           # all | any | quorum(n) | best_of(n)
-    bind:
-      by_index:                         # 第 i 个 item 绑不同厂商 —— 异构并行
-        - anthropic/claude-sonnet-4-5
-        - openai/gpt-5
-        - google/gemini-2-5-pro
-    budget: { max_parallel: 3, max_usd: 1.00 }
-    in:  { question: $.item.title }
-    out: [findings]
-
-  - id: gate
-    kind: human_gate
-    when: $.world.verdict.confidence < 0.75    # 条件为假则跳过，零成本
-
-  - id: implement
-    agent: implementer
-    needs: [judge, gate]
-    retries: 1
-    bind:
-      require: [json_schema, ctx>=128k, quality>=0.80]
-      prefer: cost
-      escalate_if: { retries: 1, to: quality }
+goal: 为 post office 实现 Codex 引擎       # 必填：要的是什么结果，而不是怎么做
+acceptance:                               # 怎样才算完成
+  - npm test 全部通过
+  - 能启动、续接、取消一个 codex 进程
+constraints:
+  - 只改 src/engines/ 和 test/engines/
+context:                                  # 动手前先读这些
+  - docs/DESIGN.md §6
+  - src/schema/types.ts
 ```
 
-**引用表达式**：`$.input.*` / `$.world.*` / `$.nodes.<id>.actual_model|actual_families|cost_usd|status|output` / `$`（当前 item）。非 `$` 开头一律视为字面量。
+**结果格式**（worker 每一轮结束时的输出，由 `codex exec --output-schema` 强制）：
 
-**守卫表达式**：只支持单次比较（`==` `!=` `<` `<=` `>` `>=`）或裸引用真值判断。**没有 `eval`——工作流文件永远是数据，不是代码。**
+```yaml
+status: done            # done | failed | blocked
+summary: 实现了 CodexEngine，支持启动、续接和取消。
+details: ……
+files_changed: [src/engines/codex.ts, test/engines/codex.test.ts]
+open_questions: []
+```
 
-`needs` 省略时默认依赖**声明顺序里的上一个节点**，所以线性流程读起来是自上而下的。
+post office 不完全相信 worker 的自述。它会在结果上补充几项可靠的事实：`git diff --stat`、事件流里实际改动的文件、用时，以及这一轮的 commit。
+
+**节省 Claude 的 token**：`wait` 只返回摘要和 diff 统计，scheduler 和 verifier 需要时再去看完整的 diff。worker 的完整工作过程只保存在日志里，不回传给 Claude。
 
 ---
 
-## 5. 可重放性
+## 6. 运行机制
 
-三件套：
+**雇人**（`spawn_agent`）：
+1. 在 `<仓库所在目录>/<仓库名>.worktrees/<agent 名>` 创建 worktree，分支名为 `syncw/<agent 名>`，基于 `base`（默认是当前分支的 HEAD）。
+2. 把岗位说明、任务和通用规则拼成 prompt。通用规则包括：你是谁、谁雇了你；只在这个 worktree 里工作；不要 push；最后按格式返回结果。
+3. 在后台启动 worker，并关闭 stdin（否则 codex 会一直等待 stdin 输入）：
+   `codex exec --json -s danger-full-access -c 'approval_policy="never"' -C <worktree> --output-schema <schema> -o <结果文件> "<prompt>"`
+4. 从事件流里的 `thread.started` 事件记下会话 id，供以后续接使用。
 
-1. **编年史**：每次运行写 `runs/<runId>/trace.jsonl`，逐事件记录绑定决策、候选、请求、响应、世界写入、冲突、升级。`meta.json` 记录逐节点成本/token/延迟/尝试次数，`world.json` 是最终世界态快照。
-2. **内容寻址缓存**：键 = `sha256(model | params | messages | 契约)`，存在 `.syncw/cache/`。
-3. **`--swap` + `diff`**：换掉任一节点的模型重跑，未被改动的节点由缓存逐字节返回。
+**每一轮结束时**：post office 读取结果文件，把这一轮的改动自动 commit 到 worker 的分支，提交信息为 `<agent 名> 第 n 轮：<摘要>`。然后记录 diff 统计，把结果交给正在等待的 `wait`。
 
-缓存是让 diff **诚实**的前提。没有它，"比较两个绑定"看到的是噪声；有了它，diff 里剩下的就是你改的那一件事。
+**续接**（`send_message`）：在 worker 的 worktree 目录里运行
+`codex exec resume <会话 id> -c 'sandbox_mode="danger-full-access"' -c 'approval_policy="never"' --json --output-schema <schema> -o <结果文件> "<消息>"`。
+试水时发现：续接时如果不显式指定沙箱模式，会退回用户配置里的默认值。所以虽然现在选择了不加沙箱，续接时仍然显式指定，以后改策略时只需改一处。
 
----
+**规则**：
+- 一个 worker 同一时间只跑一轮。这期间收到的消息先排队，下一轮一起送达。
+- post office 会把所有 agent 的状态写到磁盘。post office 重启后，之前还在运行的 worker 会被标记为"中断"，之后可以用 `send_message` 续接。
 
-## 6. 实测：级联效应
+**限制**：由 post office 强制执行，agent 无法修改。
 
-这不是假设，是 `npm run demo` 的实际输出（`scripts/demo.ts` 全自动，无需 API key，末尾带 7 项自动断言）。
-
-**基线**：六个节点，工作流里**没有任何一处写死模型**。
-
-```
-plan       anthropic/claude-opus-4-1
-research   anthropic/claude-sonnet-4-5, openai/gpt-5, google/gemini-2-5-pro   ← 异构并行
-judge      deepseek/deepseek-v3-2        ← 被约束推出三家厂商的血统之外
-implement  deepseek/deepseek-v3-2        ← quality>=0.80 地板 + prefer:cost
-verify     anthropic/claude-opus-4-1     ← 与 implement 不同族，对抗性复核
-cost $0.0500
-```
-
-**改动一行**：`--swap research=openai/gpt-5`（三个 research item 全绑 gpt-5）。
-
-```
-             基线                       重放后                          Δcost
-plan         claude-opus-4-1       →   claude-opus-4-1（全缓存）       $0.0229 → $0
-research     sonnet+gpt+gemini     →   gpt-5（1/4 缓存）               $0.0121 → $0.0060
-judge        deepseek-v3-2         →   claude-opus-4-1  ← 你没改！      $0.0003 → $0.0154   (59×)
-implement    deepseek-v3-2         →   deepseek-v3-2                   $0.0002 → $0.0002
-verify       claude-opus-4-1       →   claude-opus-4-1                 $0.0146 → $0.0130
-```
-
-**发生了什么**：research 的 `actual_families` 从 `{claude, gpt, gemini}` 变成 `{gpt}`，于是 judge 的 `not_family_of` 候选池缩小——Claude 成了质量最高的可用选项。judge 的置信度从 0.84 掉到 0.59，**触发了原本被跳过的人工闸门**，最终结论从 `passed: false` 翻成 `passed: true`。
-
-### 6.1 缓存让"总成本"变成一句谎话
-
-上面有个陷阱，值得单独说：
-
-```
-朴素总账        $0.0500 → $0.0345   (-31%)   ← 看起来省钱了
-同口径（B 中真正发起调用的 3 个节点）  $0.0150 → $0.0286   (+91%)
-```
-
-重放里被缓存命中的节点记 **$0**，所以两次运行的总成本**本来就不可比**。如果只看最后一行，你会得出"这次改动省了 31%"的结论——而事实是**干活的那部分贵了 91%**。
-
-引擎因此在 diff 里强制打印同口径对比，并在 [demo.ts](../scripts/demo.ts) 里加了"缓存节点必须恰好花费 $0"的断言。这是实现过程中由测试抓出来的真实 bug：最初缓存命中也会按 usage 计费，导致每次重放都虚报开销。
-
-> 这就是整个项目的论点：**在跨模型流水线里，你无法逐节点地推理成本和行为。** 一个局部变更会重路由下游、改写结论、并且让总账给出相反的方向。编年史是唯一会告诉你真相的东西。
-
----
-
-## 7. 失败语义
-
-失败恢复是**重新绑定**，不是应用层 try/catch。顺序固定：
-
-```
-1. retries: n        排除失败模型，按原策略重绑，共 n 次
-2. fallback: [globs] 走声明的备选链（只放松资源约束，安全约束照旧）
-3. escalate_if       切换 prefer 重新绑定（如 cost → quality）
-4. 都没有 → 抛出，run 标记 failed
-```
-
-实测（注入 `deepseek/*` 全部失败）：
-
-```
-judge      ↻  deepseek/deepseek-v3-2 failed; retrying via re-bind (0 retries left)
-judge      ⇩  deepseek/deepseek-r1 failed; walking fallback [deepseek/*, google/*, openai/*]
-judge      ✔  ollama/qwen3-235b   3 attempts
-implement  ↻  deepseek/deepseek-v3-2 failed; retrying via re-bind
-implement  ✔  openai/gpt-5-mini   2 attempts
-verify     ✔  anthropic/claude-opus-4-1
-```
-
-judge 的 fallback 链因安全约束落空（`google/*` = gemini，正是生产者血统），引擎如实记录这一点并改走通用策略，仍然强制 `not_family_of`，最终落在 qwen。**降级了资源，守住了安全。**
-
-fan-out 的 join 策略决定部分失败如何处理：`all` 全成功才通过、`any` 至少一个、`quorum(n)` 达到 n 个、`best_of(n)` 按自报置信度取前 n（写出时只提交前 n 个）。
-
----
-
-## 8. 与现有工具的位置关系
-
-| | 编排 | 绑定模型 | 共享状态 | 可重放/diff | 自适应选型 |
-|---|---|---|---|---|---|
-| LangGraph | 强（代码优先） | 弱，散在各 node | 无 | 弱 | 无 |
-| CrewAI / AutoGen | 中 | 中 | 无 | 弱 | 无 |
-| Dify / n8n / Langflow | 强（可视化） | 每节点零散 | 弱 | 无 | 无 |
-| LiteLLM / OpenRouter | — | **强** | — | — | 部分 |
-| **Syncw 目标位** | 强（声明式） | **强（策略引擎）** | **强（有合并语义）** | **强** | **强** |
-
-**不造协议层**（这是刻意的取舍）：工具用 MCP，跨进程 agent 用 A2A（已捐给 Linux Foundation），模型接入用 OpenAI 兼容格式。
-
-`providers/anthropic.yaml` 是这个取舍的具体体现：Anthropic 原生 API 不是 OpenAI 形状，而我们**没有**为它写第二个适配器，而是让你用 LiteLLM 之类的网关前置并指向它。Syncw 的价值在选型和编排，不在协议翻译。
-
----
-
-## 9. 路线图
-
-| | 内容 | 状态 |
+| 限制 | 默认值 | 防止什么 |
 |---|---|---|
-| **M0** | 引擎骨架、世界态、绑定策略、trace、缓存、`replay`+`diff` | ✅ 本仓库 |
-| **M1** | `best_of(n, by=judge)` 真调评委；契约 JSON Schema 严格校验；`join` 的 partial 语义 | |
-| **M2** | Shapes 组合子库：`chain` / `map` / `reduce` / `vote` / `debate` / `critic_loop` / `router` / `race` / `saga` | |
-| **M3** | **评测闭环 → 自适应绑定**：跑 N 个模型打分，回写 `models.yaml` 的 `quality`；影子模式 + 灰度晋升 | ← 真正的 payoff |
-| **M4** | 可观测 UI、人在环交互、预算面板。UI 是 DSL 的投影，不是真相源 | |
-| **M5** | 元代理 Omnius：读编年史，提议并热改工作流 | |
-
-**M3 是灵魂。** 现在 `models.yaml` 里的 `quality` 是静态先验——那只是一个占位符。一旦用本项目的评测历史去覆写它，系统就会**从自己的运行记录里学会哪个节点该绑哪个模型**。到那时，"Synchronized World" 就从比喻变成了涌现出来的性质，而且这是目前没人做到的。
+| `max_parallel` | 4 | 同时运行的 worker 太多 |
+| `max_agents` | 12 | 一次运行里雇的人太多 |
+| `max_turns` | 10 | 一个 worker 来回修改，没完没了 |
+| `turn_timeout` | 30 分钟 | 某一轮卡死 |
 
 ---
 
-## 10. 已知限制（M0 如实说明）
+## 7. 安全
 
-- **mock provider 不是语言模型。** 它是确定性合成器，按模型族改变行文风格（未知族也会派生出独立声线，否则跨模型 diff 会退化成"看起来一样"），好让跨模型 diff 有意义。所有机制（绑定、缓存、重放、diff、升级）在接真实 provider 后行为完全一致，但**输出内容本身没有语义价值**。
-- **测试覆盖的是机制，不是模型质量。** `npm test` 的 75 个用例跑在合成器上，验证的是引擎的决策与记账逻辑；接真实 provider 后仍需用 M3 的评测闭环来验证业务效果。
-- **`models/models.yaml` 里的价格和能力是示意值。** 请以厂商定价页为准。文件开头已注明。
-- **`temperature` 默认 0**，为了重放可复现。需要多样性的场景（debate）应在工作流里显式覆盖。
-- **`when` 守卫只支持单次比较**，没有布尔组合。需要复杂条件时用中间节点表达。
-- **fan-out 的 item 数在运行前未知**，所以 `syncw bind` 用 `by_index` 长度做名义宽度做预测；真实宽度由生产者节点决定。
-- **人在环的拒绝语义是中止整个 run**，没有实现"打回重做"。
-- **token 估算对 mock 是 `字符数/4`**，真实 provider 走 API 返回的 usage。
-- **缓存命中不产生费用，但 token 仍然计入统计。** 这是刻意的：费用是"这次花了多少钱"，token 是"多少信息流过了世界态"。`diff` 会强制打印同口径成本对比，避免总账误导（见 §6.1）。
+你选择了 **B：worker 不加沙箱**，这和你平时使用 Codex 的方式一致。这意味着，理论上 worker 能改你电脑上的任何文件。我们接受这个风险，并用下面这些办法兜底：
+
+- 每个 worker 独占一个 worktree 和分支，每一轮的工作都会自动 commit，全程可查、可回退。
+- prompt 里明确要求 worker 只在自己的 worktree 里工作，不要 push。
+- 没有经过 verifier 审查的东西，一律不合并。
+- 所有事件都记录在日志里。
+
+worker 沿用你的 Codex 配置（`~/.codex/config.toml`），包括模型 `gpt-6-astra` 和推理强度。
 
 ---
 
-## 11. 三条不要做
+## 8. 你能看到什么
 
-1. **别先做拖拽 UI。** 先 DSL + CLI，UI 是 DSL 的投影。
-2. **别养一堆 provider SDK。** 差异化不在接入层。
-3. **别把编排逻辑写回 TypeScript/Python。** 那就退回 LangGraph 了——工作流必须是数据，否则重放、diff、自适应绑定全部无从谈起。
+- **在对话里**：scheduler 会告诉你雇了谁、每个人在做什么、结果怎样，有需要时也会向你提问。你也可以随时让它调用 `list_agents`。
+- **在终端里**：`npm run status` 显示最近一次运行的团队现状。它只读取磁盘上的记录，所以 post office 没在运行时也能用。
+- **在磁盘上**：`runs/<运行 id>/` 目录下有：
+  - `agents.json`：所有 agent 的状态
+  - `<agent 名>/events.jsonl`：Codex 的完整事件流
+  - `<agent 名>/turn-<n>.json`：每一轮的结果
+- **在 git 里**：每个 worker 一个分支，每一轮一个 commit。
+
+---
+
+## 9. 代码结构
+
+```
+AGENTS.md                      每个 Codex worker 都会自动读取的编码规范
+roles/                         worker 角色模板：engineer.md、architect.md、researcher.md
+.claude/agents/verifier.md     verifier subagent（安装时复制到 ~/.claude/agents/）
+src/
+  schema/types.ts              Task、Result、Agent 等共享类型（也就是"合同"）
+  schema/result.schema.json    给 codex --output-schema 用的结果格式
+  engines/codex.ts             启动、续接、取消 codex 进程，解析事件流
+  postoffice/registry.ts       agent 登记、状态管理、持久化到磁盘，以及运行日志
+  postoffice/worktrees.ts      创建和清理 worktree、自动 commit、diff 统计
+  postoffice/prompt.ts         把角色、任务、通用规则拼成 prompt
+  postoffice/core.ts           post office 的核心逻辑：雇人、转发、等待、各项限制
+  postoffice/server.ts         MCP server，把第 5 节的工具一一对应到 core.ts
+  postoffice/main.ts           post office 的启动入口（stdio）
+  status/read.ts               从 runs/ 读出一次运行的团队现状，只读
+  status/format.ts             把团队现状排成终端里看的文本
+  cli/syncw.ts                 命令行入口：syncw status
+  runtime/world.ts             公告板（沿用 M0，milestone 2 使用）
+test/
+  fake-codex/                  一个假的 codex 程序，测试时不调用真的 Codex
+```
+
+新增依赖：`@modelcontextprotocol/sdk`（官方的 MCP SDK）。
+
+**接入 Claude Code**：post office 在用户级注册（`claude mcp add --scope user syncw -- node <路径>/src/postoffice/server.ts`），这样在任何项目里都能用。verifier subagent 也放在用户级（`~/.claude/agents/`）。scheduler 的工作守则通过 MCP server 的 instructions 下发，接上就生效。
+
+**M0 代码的去留**：
+- 保留：`src/runtime/world.ts` 及其测试。
+- 删除，需要时可以从 tag `m0-deepseek` 恢复：`src/runtime/` 下的 `engine.ts`、`binding.ts`、`requirements.ts`、`refs.ts`、`cache.ts`、`trace.ts`；`src/report.ts`、`src/util/glob.ts`、`src/context.ts`、`src/cli.ts`；旧的 `src/schema/`、`src/providers/`；根目录下的 `agents/`、`workflows/`、`models/`、`providers/`、`scripts/demo.ts`、`syncw.yaml`；以及对应的测试。其中 `openai-compat.ts` 会在 milestone 3 接入 DeepSeek 时恢复。M0 的 `trace.ts` 是为一次性运行设计的，运行日志改由 `registry.ts` 直接追加写入，更简单。
+
+---
+
+## 10. 里程碑
+
+| | 做什么 | 验收 |
+|---|---|---|
+| **1** | post office（MCP server）、Codex 引擎、verifier subagent、worker 角色模板 | 跑通第 2 节的场景：两个 Codex worker 并行完成一个真实任务，verifier 审查，续接修改一次，最后合并 |
+| **2** | worker 之间直接通信（Codex 连上 post office 的 MCP，获得 `send_message`）、公告板、worker 雇人（带权限收窄） | 两个 worker 不经过 scheduler，直接商定一个共同的接口 |
+| **3** | 无人值守的 scheduler（不需要开着对话）、DeepSeek 引擎 | 给一个目标，没人看着也能跑完 |
+
+---
+
+## 11. 怎么把它造出来
+
+不把整份文档一次性交给 Codex。一次给得太多、留的空白太多，执行的人只能自己猜，猜错就会跑偏。我们的做法是**用这套模式来造它自己**：
+
+1. **我先写"合同"**：`schema/types.ts`、`result.schema.json`、工具接口，以及假的 codex 程序。这部分量不大，但最关键：几个 worker 照着同一份合同写代码，就不会做出互相矛盾的隐含决定。
+2. **拆成小任务，派给 Codex worker 并行完成**，每个任务都带验收测试：
+   - 任务 A：Codex 引擎（`engines/codex.ts`）
+   - 任务 B：登记、worktree 和日志（`postoffice/registry.ts`、`worktrees.ts`）
+   - 任务 C：post office 核心、prompt 拼装和 MCP server（`core.ts`、`prompt.ts`、`server.ts`），等 A、B 合并之后再做
+   - 任务 D：角色模板、verifier subagent、README（这部分是写 prompt，需要判断力，由我来写）
+
+   删除 M0 代码是机械操作，已经和"合同"一起完成。
+3. **我当 scheduler 和 verifier**：审 diff、跑测试、要求修改，合格后合并。
+
+这一步相当于先手工扮演一遍 post office，边造边验证这个模式哪里顺、哪里卡。milestone 1 完成以后，milestone 2 就用 post office 本身来造。
+
+开发在新分支 `dev` 上进行。worker 的分支从 `dev` 分出，再合并回 `dev`。`master` 保持不动，等 milestone 1 验收后再合并。
+
+---
+
+## 12. 风险
+
+- **Codex 偏离合同**：合同先行，任务拆小，每个任务带测试，逐个验收。
+- **几个 worker 改到同一个文件**：任务按模块划分，共享的类型由我先写好。
+- **worker 不加沙箱**：见第 7 节。
+- **Claude 的 token 成本**：结果只回传摘要；verifier 先看 diff 统计，需要时才看完整 diff。
+- **Windows 上的小问题**：Codex 执行命令的输出是 GBK 编码，会出现乱码。所以 post office 不解析命令输出，改动一律以事件流和 `git diff` 为准。
+
+---
+
+## 13. 开放问题
+
+每个问题都有默认做法（加粗）。不同意的地方请告诉我。
+
+1. **worktree 放在哪里？** 默认：**放在仓库旁边的 `<仓库名>.worktrees/` 目录里**，比如 `E:\Eproject\Syncw.worktrees\engineer-1`。
+2. **verifier 用哪个 Claude 模型？** 默认：**Sonnet**。它比 scheduler 便宜，用来做常规审查；遇到重要的审查，由 scheduler 决定改用 Opus。
+3. **worker 用什么配置？** 默认：**沿用你的 Codex 配置**，即 `gpt-6-astra`、推理强度 xhigh。另一种做法是给 worker 单独一套配置，比如简单任务用更低的推理强度，跑得更快。
