@@ -1,6 +1,6 @@
 # Syncw 设计（v3）
 
-> **状态：草稿，待你审阅（2026-10-13）。还没有实现任何代码。**
+> **状态：milestone 1 已经实现，第 2 节的验收场景已经跑通（2026-10-14）。**
 >
 > 本文取代 v2 草稿和 M0 的文档。v2 设想用 DeepSeek 自建 agent 循环，从未提交。M0 是 DeepSeek 写的模型路由流水线，保存在 git tag `m0-deepseek`。旧文档可以这样查看：`git show m0-deepseek:docs/DESIGN.md`、`git show m0-deepseek:docs/AGENT-MESH.md`。
 
@@ -170,6 +170,7 @@ worker 沿用你的 Codex 配置（`~/.codex/config.toml`），包括模型 `gpt
 ## 8. 你能看到什么
 
 - **在对话里**：scheduler 会告诉你雇了谁、每个人在做什么、结果怎样，有需要时也会向你提问。你也可以随时让它调用 `list_agents`。
+- **在终端里**：`npm run status` 显示最近一次运行的团队现状。它只读取磁盘上的记录，所以 post office 没在运行时也能用。
 - **在磁盘上**：`runs/<运行 id>/` 目录下有：
   - `agents.json`：所有 agent 的状态
   - `<agent 名>/events.jsonl`：Codex 的完整事件流
@@ -193,6 +194,10 @@ src/
   postoffice/prompt.ts         把角色、任务、通用规则拼成 prompt
   postoffice/core.ts           post office 的核心逻辑：雇人、转发、等待、各项限制
   postoffice/server.ts         MCP server，把第 5 节的工具一一对应到 core.ts
+  postoffice/main.ts           post office 的启动入口（stdio）
+  status/read.ts               从 runs/ 读出一次运行的团队现状，只读
+  status/format.ts             把团队现状排成终端里看的文本
+  cli/syncw.ts                 命令行入口：syncw status
   runtime/world.ts             公告板（沿用 M0，milestone 2 使用）
 test/
   fake-codex/                  一个假的 codex 程序，测试时不调用真的 Codex

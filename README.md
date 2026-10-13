@@ -17,7 +17,9 @@
 
 ## 状态
 
-milestone 1 的代码已经完成：post office、Codex 引擎、MCP server、角色模板和 verifier。共 100 个测试，全部通过。在真实 Claude Code 会话里的验收还没做。
+milestone 1 的代码已经完成：post office、Codex 引擎、MCP server、角色模板、verifier，以及查看团队现状的 `syncw status` 命令。共 135 个测试：134 个通过，1 个要用真的 Codex，默认跳过。
+
+验收场景（[DESIGN §2](docs/DESIGN.md)）已经在真实的 Claude Code 会话里跑通，用的任务就是 `syncw status` 命令本身：scheduler 先写好合同，再雇 2 个 Codex worker 并行开工；verifier 分别审查，各提出了问题；scheduler 用 `send_message` 让原来的 worker 在原会话里修改；最后合并两个分支。
 
 milestone 1 的代码本身就是用这套方式造出来的：Claude 先写好"合同"（`src/schema/types.ts`），再把实现派给 4 个 Codex worker 并行完成，审查通过后合并。
 
@@ -64,6 +66,7 @@ worker 的角色可以套用 `roles/` 里的模板（`engineer`、`architect`、
 
 ## 去哪里看
 
+- `npm run status`：最近一次运行的团队现状，包括每个 agent 的角色、状态、轮数、最近一次结果和任务目标。还没雇人的空运行会被跳过。它只读取磁盘上的记录，所以 post office 没在运行时也能用。`npm run status -- --run <运行 id>` 查看指定的一次运行，`npm run status -- --json` 输出原始数据。
 - `runs/<运行 id>/agents.json`：所有 agent 的状态
 - `runs/<运行 id>/<agent>/`：每一轮的 prompt、结果，以及 Codex 的完整事件流
 - git 分支 `syncw/<agent>`：每一轮的工作都会自动 commit，作者是 `<agent> (syncw)`
