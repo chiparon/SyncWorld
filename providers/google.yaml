@@ -1,8 +1,0 @@
-# Gemini exposes an OpenAI-compatible surface, so no bespoke adapter is needed.
-
-name: google
-kind: openai-compat
-base_url: https://generativelanguage.googleapis.com/v1beta/openai
-api_key_env: GEMINI_API_KEY
-timeout_ms: 180000
-max_retries: 3

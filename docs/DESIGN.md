@@ -181,17 +181,18 @@ worker 沿用你的 Codex 配置（`~/.codex/config.toml`），包括模型 `gpt
 ## 9. 代码结构
 
 ```
+AGENTS.md                      每个 Codex worker 都会自动读取的编码规范
 roles/                         worker 角色模板：engineer.md、architect.md、researcher.md
 .claude/agents/verifier.md     verifier subagent（安装时复制到 ~/.claude/agents/）
 src/
   schema/types.ts              Task、Result、Agent 等共享类型（也就是"合同"）
   schema/result.schema.json    给 codex --output-schema 用的结果格式
   engines/codex.ts             启动、续接、取消 codex 进程，解析事件流
-  postoffice/registry.ts       agent 登记、状态管理、持久化到磁盘
+  postoffice/registry.ts       agent 登记、状态管理、持久化到磁盘，以及运行日志
   postoffice/worktrees.ts      创建和清理 worktree、自动 commit、diff 统计
   postoffice/prompt.ts         把角色、任务、通用规则拼成 prompt
-  postoffice/server.ts         MCP server，注册第 5 节的工具
-  runtime/trace.ts             事件日志（沿用 M0）
+  postoffice/core.ts           post office 的核心逻辑：雇人、转发、等待、各项限制
+  postoffice/server.ts         MCP server，把第 5 节的工具一一对应到 core.ts
   runtime/world.ts             公告板（沿用 M0，milestone 2 使用）
 test/
   fake-codex/                  一个假的 codex 程序，测试时不调用真的 Codex
@@ -202,8 +203,8 @@ test/
 **接入 Claude Code**：post office 在用户级注册（`claude mcp add --scope user syncw -- node <路径>/src/postoffice/server.ts`），这样在任何项目里都能用。verifier subagent 也放在用户级（`~/.claude/agents/`）。scheduler 的工作守则通过 MCP server 的 instructions 下发，接上就生效。
 
 **M0 代码的去留**：
-- 保留：`src/runtime/trace.ts`、`src/runtime/world.ts`，以及它们的测试。
-- 删除，需要时可以从 tag `m0-deepseek` 恢复：`src/runtime/` 下的 `engine.ts`、`binding.ts`、`requirements.ts`、`refs.ts`、`cache.ts`；`src/report.ts`、`src/util/glob.ts`、`src/context.ts`、`src/cli.ts`；旧的 `src/schema/`、`src/providers/`；根目录下的 `agents/`、`workflows/`、`models/`、`providers/`、`scripts/demo.ts`；以及对应的测试。其中 `openai-compat.ts` 会在 milestone 3 接入 DeepSeek 时恢复。
+- 保留：`src/runtime/world.ts` 及其测试。
+- 删除，需要时可以从 tag `m0-deepseek` 恢复：`src/runtime/` 下的 `engine.ts`、`binding.ts`、`requirements.ts`、`refs.ts`、`cache.ts`、`trace.ts`；`src/report.ts`、`src/util/glob.ts`、`src/context.ts`、`src/cli.ts`；旧的 `src/schema/`、`src/providers/`；根目录下的 `agents/`、`workflows/`、`models/`、`providers/`、`scripts/demo.ts`、`syncw.yaml`；以及对应的测试。其中 `openai-compat.ts` 会在 milestone 3 接入 DeepSeek 时恢复。M0 的 `trace.ts` 是为一次性运行设计的，运行日志改由 `registry.ts` 直接追加写入，更简单。
 
 ---
 
@@ -225,8 +226,10 @@ test/
 2. **拆成小任务，派给 Codex worker 并行完成**，每个任务都带验收测试：
    - 任务 A：Codex 引擎（`engines/codex.ts`）
    - 任务 B：登记、worktree 和日志（`postoffice/registry.ts`、`worktrees.ts`）
-   - 任务 C：MCP server 和 prompt 拼装（`server.ts`、`prompt.ts`），等 A、B 合并之后再做
-   - 任务 D：删除 M0 代码、更新 README
+   - 任务 C：post office 核心、prompt 拼装和 MCP server（`core.ts`、`prompt.ts`、`server.ts`），等 A、B 合并之后再做
+   - 任务 D：角色模板、verifier subagent、README（这部分是写 prompt，需要判断力，由我来写）
+
+   删除 M0 代码是机械操作，已经和"合同"一起完成。
 3. **我当 scheduler 和 verifier**：审 diff、跑测试、要求修改，合格后合并。
 
 这一步相当于先手工扮演一遍 post office，边造边验证这个模式哪里顺、哪里卡。milestone 1 完成以后，milestone 2 就用 post office 本身来造。

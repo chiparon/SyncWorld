@@ -1,0 +1,30 @@
+{
+  "type": "object",
+  "properties": {
+    "status": {
+      "type": "string",
+      "enum": ["done", "failed", "blocked"],
+      "description": "done: the acceptance criteria are met. failed: you tried and could not. blocked: you cannot proceed without a decision or access only your hirer can give."
+    },
+    "summary": {
+      "type": "string",
+      "description": "One or two sentences. This is the first thing your hirer reads."
+    },
+    "details": {
+      "type": "string",
+      "description": "What your hirer needs beyond the summary: decisions you made and why, test results, caveats."
+    },
+    "files_changed": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Paths relative to your worktree."
+    },
+    "open_questions": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Questions only your hirer can answer. Empty if there are none."
+    }
+  },
+  "required": ["status", "summary", "details", "files_changed", "open_questions"],
+  "additionalProperties": false
+}

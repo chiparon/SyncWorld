@@ -1,27 +1,16 @@
 {
   "name": "syncw",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
-  "description": "Syncw (Synchronized World) - declarative multi-agent orchestration where agent behaviour, provider access, and model capability are three orthogonal, hot-swappable registries.",
+  "description": "Syncw (Synchronized World) - a post office for AI agents: a Claude scheduler hires Codex workers, each in its own git worktree, through an MCP server.",
   "engines": {
     "node": ">=22.18"
   },
-  "bin": {
-    "syncw": "./src/cli.ts"
-  },
   "scripts": {
-    "syncw": "node src/cli.ts",
-    "bind": "node src/cli.ts bind workflows/feature-dev.yaml",
-    "run:hello": "node src/cli.ts run workflows/hello.yaml",
-    "run:demo": "node src/cli.ts run workflows/feature-dev.yaml",
-    "demo": "node scripts/demo.ts",
-    "test": "node --test",
+    "test": "node --test \"test/**/*.test.ts\"",
     "typecheck": "tsc --noEmit",
-    "verify": "npm run typecheck && npm test && npm run demo"
-  },
-  "dependencies": {
-    "yaml": "^2.9.1"
+    "verify": "npm run typecheck && npm test"
   },
   "devDependencies": {
     "@types/node": "^26.6.4",
