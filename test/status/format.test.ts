@@ -57,16 +57,62 @@ for (const status of ['done', 'failed', 'blocked'] as const) {
   });
 }
 
-test('null results show first-line errors and explicit timeout and cancellation facts', () => {
-  for (const [timed_out, cancelled] of [[false, false], [true, false], [false, true], [true, true]]) {
+test('null results show errors and only the timeout and cancellation flags that are set', () => {
+  for (const [timed_out, cancelled, expected] of [
+    [false, false, 'no result'],
+    [true, false, 'no result (timed out)'],
+    [false, true, 'no result (cancelled)'],
+    [true, true, 'no result (timed out, cancelled)'],
+  ] as const) {
     const text = formatRunStatus(run([agent({
       last_turn: { result: null, facts: facts({ error: 'Engine crashed.\nStack trace.', timed_out, cancelled }) },
     })]));
-    assert.ok(text.includes(`no result; error: Engine crashed.; timed out: ${timed_out ? 'yes' : 'no'}; cancelled: ${cancelled ? 'yes' : 'no'}`));
-    assert.doesNotMatch(text, /Stack trace/);
+    const row = text.split('\n').find(line => line.startsWith('engineer-1'))!;
+    assert.ok(row.endsWith(`${expected}; error: Engine crashed.`));
+    assert.doesNotMatch(text, /Stack trace|: no|: yes/);
   }
-  assert.ok(formatRunStatus(run([agent({ last_turn: { result: null, facts: facts() } })]))
-    .includes('no result; timed out: no; cancelled: no'));
+  const text = formatRunStatus(run([agent({ last_turn: { result: null, facts: facts() } })]));
+  assert.match(text, /no result\n/);
+  assert.doesNotMatch(text, /timed out|cancelled|error:/);
+});
+
+test('measured errors, timeouts and cancellations remain visible alongside valid results', () => {
+  for (const status of ['done', 'failed', 'blocked'] as const) {
+    for (const [patch, expected] of [
+      [{ error: 'Auto-commit failed: hook rejected.\nHidden error.' }, `${status}: First line.; error: Auto-commit failed: hook rejected.`],
+      [{ timed_out: true }, `${status} (timed out): First line.`],
+      [{ cancelled: true }, `${status} (cancelled): First line.`],
+      [{ timed_out: true, cancelled: true, error: 'Engine stopped.' }, `${status} (timed out, cancelled): First line.; error: Engine stopped.`],
+    ] as const) {
+      const last_turn = result(status)!;
+      last_turn.facts = facts(patch);
+      const text = formatRunStatus(run([agent({ last_turn })]));
+      const row = text.split('\n').find(line => line.startsWith('engineer-1'))!;
+      assert.ok(row.endsWith(expected));
+      assert.doesNotMatch(text, /Hidden error|: no|: yes/);
+    }
+  }
+});
+
+test('summary, goal and error use their first non-blank line', () => {
+  const last_turn = result('done', '\n \t\r\n\u001b[32m\u001b[0m\nSummary.\nHidden summary.')!;
+  last_turn.facts.error = '\r\n\t \u2028Error.\nHidden error.';
+  const text = formatRunStatus(run([agent({
+    goal: '\n\t \u2029Goal.\nHidden goal.', last_turn,
+  })]));
+  assert.ok(text.includes('done: Summary.; error: Error.'));
+  assert.ok(text.includes('  Goal: Goal.'));
+  assert.doesNotMatch(text, /Hidden|\u001b/);
+  last_turn.result = null;
+  assert.ok(formatRunStatus(run([agent({ last_turn })])).includes('no result; error: Error.'));
+});
+
+test('blank summaries and errors do not produce empty labels', () => {
+  const last_turn = result('done', '\n \t\n')!;
+  last_turn.facts.error = '\r\n\t ';
+  const text = formatRunStatus(run([agent({ last_turn })]));
+  assert.match(text, /done\n/);
+  assert.doesNotMatch(text, /done:|error:/);
 });
 
 test('elapsed time uses supplied seconds and queue counts appear only when nonzero', () => {
@@ -139,8 +185,19 @@ test('empty run prints the header and explains there are no agents yet', () => {
   ].join('\n'));
 });
 
-test('invalid widths explain how to request uncut output', () => {
-  for (const width of [0, -1, 1.5, NaN, Infinity]) {
-    assert.throws(() => formatRunStatus(run([]), { width }), /positive integer; omit width/);
+test('unusable widths leave output uncut', () => {
+  const status = run([agent({ last_turn: result('done', '完成测试'.repeat(30)) })]);
+  const full = formatRunStatus(status);
+  for (const width of [0, -1, 0.5, NaN, Infinity, -Infinity]) {
+    assert.equal(formatRunStatus(status, { width }), full);
+  }
+});
+
+test('usable fractional widths are floored before cutting', () => {
+  const status = run([agent({ last_turn: result('done', '完成测试'.repeat(30)) })]);
+  for (const width of [1.5, 20.9, 60.5]) {
+    const text = formatRunStatus(status, { width });
+    assert.equal(text, formatRunStatus(status, { width: Math.floor(width) }));
+    assert.ok(text.includes('…'));
   }
 });

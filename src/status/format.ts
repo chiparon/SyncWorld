@@ -9,6 +9,11 @@ function firstLine(text: string): string {
     .replace(/[\u0000-\u001f\u007f-\u009f]/g, ' ');
 }
 
+function firstNonBlankLine(text: string): string {
+  return stripVTControlCharacters(text).split(/[\r\n\u2028\u2029]/)
+    .map(firstLine).find(line => line.trim().length > 0) ?? '';
+}
+
 /** Count display cells, keeping combining sequences and emoji together when cutting. */
 function cellWidth(grapheme: string): number {
   const visible = grapheme.replace(/[\p{Mark}\p{Cf}]/gu, '');
@@ -59,9 +64,13 @@ function duration(seconds: number): string {
 function lastResult(agent: AgentStatusView): string {
   if (!agent.last_turn) return 'no result yet';
   const { result, facts } = agent.last_turn;
-  if (result) return `${result.status}: ${firstLine(result.summary)}`;
-  const error = facts.error === undefined ? '' : `; error: ${firstLine(facts.error)}`;
-  return `no result${error}; timed out: ${facts.timed_out ? 'yes' : 'no'}; cancelled: ${facts.cancelled ? 'yes' : 'no'}`;
+  const flags = [];
+  if (facts.timed_out) flags.push('timed out');
+  if (facts.cancelled) flags.push('cancelled');
+  const outcome = `${result?.status ?? 'no result'}${flags.length ? ` (${flags.join(', ')})` : ''}`;
+  const summary = result ? firstNonBlankLine(result.summary) : '';
+  const error = firstNonBlankLine(facts.error ?? '');
+  return `${outcome}${summary ? `: ${summary}` : ''}${error ? `; error: ${error}` : ''}`;
 }
 
 /**
@@ -69,10 +78,9 @@ function lastResult(agent: AgentStatusView): string {
  * newline. `syncw status` prints it.
  */
 export function formatRunStatus(status: RunStatus, opts?: StatusFormatOptions): string {
-  const width = opts?.width;
-  if (width !== undefined && (!Number.isInteger(width) || width < 1)) {
-    throw new RangeError('Status width must be a positive integer; omit width for uncut output.');
-  }
+  const requestedWidth = opts?.width;
+  const width = typeof requestedWidth === 'number' && Number.isFinite(requestedWidth) && requestedWidth >= 1
+    ? Math.floor(requestedWidth) : undefined;
   const counts = statuses.map(state => {
     const count = status.agents.filter(agent => agent.status === state).length;
     return count ? `${count} ${state}` : '';
@@ -96,7 +104,7 @@ export function formatRunStatus(status: RunStatus, opts?: StatusFormatOptions): 
     ).join('  ');
     lines.push('', rowText(headings));
     status.agents.forEach((agent, i) => {
-      lines.push(rowText(rows[i]!), `  Goal: ${firstLine(agent.goal)}`);
+      lines.push(rowText(rows[i]!), `  Goal: ${firstNonBlankLine(agent.goal)}`);
       const extra: string[] = [];
       if (agent.running_for_s !== undefined) extra.push(`Running: ${duration(agent.running_for_s)}`);
       if (agent.queued_messages > 0) extra.push(`Queued messages: ${agent.queued_messages}`);
