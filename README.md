@@ -4,15 +4,11 @@
 
 You write who does what and under which policy. Syncw resolves *which model* at runtime, records why, and lets you replay the whole run on different models and see exactly what changed.
 
-> ### 📐 Where this is going
+> ### 🚧 Redesign in progress
 >
-> M0 (everything in this README, runnable today) treats an "agent" as a *prompt + output contract* executed as one model call.
+> Syncw is being redesigned around **agents that talk to each other, hire new agents, and hold roles** (Scheduler, Architect, Verifier, …). The new design is **[docs/DESIGN.md](docs/DESIGN.md)**.
 >
-> The target architecture treats an "agent" as **an existing agent application** — Codex CLI, Claude Code — driven as a long-running session, with a planner in one and an executor in the other.
->
-> That design is written up in **[docs/AGENT-MESH.md](docs/AGENT-MESH.md)**: a driver layer that survives minor CLI updates (capability contract + fingerprint drift detection + conformance probe), coordination over git/issue/chat rather than a bespoke scheduler, and a `TaskPackage` / `RunResult` handoff protocol.
->
-> It also documents, honestly, which parts of M0 **do not survive** the change — most notably the content-addressed cache, which is unsound when a "call" mutates a filesystem.
+> The rest of this README still describes M0, the model-routing pipeline below. M0 is saved at git tag `m0-deepseek`, and this README will be rewritten when the new code lands.
 
 ```yaml
 - id: implement
@@ -152,4 +148,4 @@ Anthropic's native API is not OpenAI-shaped, and Syncw deliberately does **not**
 - Not a visual builder. The DSL is the source of truth; a UI would be a projection of it.
 - Not a code-first graph library. Orchestration is **data** — that is precisely what makes replay, diff, and (next) self-tuning routing possible.
 
-**M0 status:** the engine, world state, binding policy, chronicle, cache and replay/diff are implemented and runnable. Evaluation-driven routing is the next milestone — see [docs/DESIGN.md](docs/DESIGN.md) §9.
+**M0 status:** the engine, world state, binding policy, chronicle, cache and replay/diff are implemented and runnable. M0 is frozen at tag `m0-deepseek`; what comes next is in [docs/DESIGN.md](docs/DESIGN.md).
