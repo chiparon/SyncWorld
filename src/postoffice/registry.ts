@@ -171,6 +171,10 @@ export function openRegistry(opts: OpenRegistryOptions): Registry {
     try {
       // Read again after claiming: a previous owner may have saved while we were selecting.
       records = JSON.parse(readFileSync(statePath, 'utf8'));
+      if (!records.some((agent) => agent.status !== 'closed')) {
+        registry.close();
+        return openRegistry({ ...opts, mode: 'new' });
+      }
       const interrupted = records
         .filter((agent) => agent.status === 'queued' || agent.status === 'running')
         .map((agent) => agent.name);
