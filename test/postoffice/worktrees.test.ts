@@ -73,6 +73,77 @@ test('create resolves an explicit commit-ish instead of using HEAD', async (t) =
   assert.equal(existsSync(join(created.worktree, 'later.txt')), false);
 });
 
+test('usedNames returns local syncw branches only', async (t) => {
+  const { repo, base, worktrees } = await fixture(t);
+  await git(repo, 'branch', 'syncw/engineer-1');
+  await git(repo, 'branch', 'syncw/researcher-1');
+  await git(repo, 'branch', 'other/engineer-2');
+  await git(repo, 'branch', 'syncw-other/engineer-3');
+  await git(repo, 'tag', 'syncw/engineer-4');
+  await git(repo, 'update-ref', 'refs/remotes/origin/syncw/engineer-5', base);
+
+  assert.deepEqual(await worktrees.usedNames(repo), new Set(['engineer-1', 'researcher-1']));
+});
+
+test('usedNames preserves the entire nested branch name after syncw/', async (t) => {
+  const { repo, worktrees } = await fixture(t);
+  await git(repo, 'branch', 'syncw/a/b');
+  await git(repo, 'branch', 'syncw/a/c/d');
+
+  assert.deepEqual(await worktrees.usedNames(repo), new Set(['a/b', 'a/c/d']));
+});
+
+test('usedNames returns entries including unregistered directories and plain files', async (t) => {
+  const { repo, worktrees } = await fixture(t);
+  const directory = `${repo}.worktrees`;
+  mkdirSync(join(directory, 'stray', 'nested'), { recursive: true });
+  writeFileSync(join(directory, 'plain-file'), 'occupied');
+  await git(repo, 'worktree', 'add', '--detach', join(directory, 'registered'), 'HEAD');
+
+  assert.deepEqual(await worktrees.usedNames(repo), new Set(['stray', 'plain-file', 'registered']));
+});
+
+test('usedNames combines branches and entries without duplicates', async (t) => {
+  const { repo, worktrees } = await fixture(t);
+  await worktrees.create(repo, 'engineer-1');
+  await git(repo, 'branch', 'syncw/engineer-2');
+  mkdirSync(join(`${repo}.worktrees`, 'engineer-3'));
+
+  assert.deepEqual(await worktrees.usedNames(repo), new Set(['engineer-1', 'engineer-2', 'engineer-3']));
+});
+
+test('usedNames returns an empty set when no branches or worktrees directory exist', async (t) => {
+  const { repo, worktrees } = await fixture(t);
+  assert.equal(existsSync(`${repo}.worktrees`), false);
+  assert.deepEqual(await worktrees.usedNames(repo), new Set());
+});
+
+test('usedNames returns an empty set for an empty worktrees directory', async (t) => {
+  const { repo, worktrees } = await fixture(t);
+  mkdirSync(`${repo}.worktrees`);
+  assert.deepEqual(await worktrees.usedNames(repo), new Set());
+});
+
+test('usedNames resolves a repository subdirectory to its top level', async (t) => {
+  const { repo, worktrees } = await fixture(t);
+  const nested = join(repo, 'nested directory');
+  mkdirSync(nested);
+  await git(repo, 'branch', 'syncw/engineer-1');
+  mkdirSync(join(`${repo}.worktrees`, 'engineer-2'), { recursive: true });
+
+  assert.deepEqual(await worktrees.usedNames(nested), new Set(['engineer-1', 'engineer-2']));
+});
+
+test('usedNames rejects non-repositories with the failing git command', async (t) => {
+  const { root, worktrees } = await fixture(t);
+  await assert.rejects(worktrees.usedNames(root), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.match(error.message, /Git command failed:.*git.*core\.quotepath=false.*rev-parse.*--show-toplevel/);
+    assert.match(error.message, /fatal:/);
+    return true;
+  });
+});
+
 test('create rejects existing worktrees and paths without overwriting them', async (t) => {
   const { root, repo, worktrees } = await fixture(t);
   const created = await worktrees.create(repo, 'engineer-1');

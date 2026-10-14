@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { existsSync, readdirSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 
 import type { Worktrees } from '../schema/types.ts';
@@ -78,9 +78,23 @@ export function createWorktrees(opts: { git?: string } = {}): Worktrees {
         }
       }
     },
-    // Placeholder until the names task lands: no names are reserved yet.
-    async usedNames() {
-      return new Set<string>();
+    async usedNames(repo) {
+      const top = resolve((await git(['-C', repo, 'rev-parse', '--show-toplevel'])).stdout.trim());
+      const prefix = 'refs/heads/syncw/';
+      const branches = await git(['-C', top, 'for-each-ref', '--format=%(refname)', prefix]);
+      const names = new Set(branches.stdout.split(/\r?\n/)
+        .filter((ref) => ref.startsWith(prefix))
+        .map((ref) => ref.slice(prefix.length)));
+
+      // Unregistered directories and plain files block create just as worktrees do.
+      try {
+        for (const name of readdirSync(join(dirname(top), `${basename(top)}.worktrees`))) {
+          names.add(name);
+        }
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      }
+      return names;
     },
   };
 }
