@@ -677,6 +677,62 @@ test('a failed launch retains messages without automatically retrying and the ne
   assert.deepEqual(f.registry.get(agent.name)!.queued_messages, []);
 });
 
+test('a failed queue clear still awaits the accepted turn and records its real result before retrying delivery', async (t) => {
+  const f = await fixture(t);
+  const agent = await f.office.spawnAgent({ brief: 'Role', task: { goal: 'Finish.' } });
+  await f.drain();
+  const session = f.registry.get(agent.name)!.session_id;
+  const update = f.registry.update;
+  let fail = true;
+  f.registry.update = (name, patch) => {
+    if (fail && patch.queued_messages?.length === 0) {
+      fail = false;
+      throw new Error('disk full during queue clear');
+    }
+    return update(name, patch);
+  };
+  const startTurn = f.engine.startTurn;
+  let running = 0;
+  let peakRunning = 0;
+  f.engine.startTurn = (request) => {
+    const turn = startTurn(request);
+    running++;
+    peakRunning = Math.max(peakRunning, running);
+    void turn.done.then(() => { running--; });
+    return turn;
+  };
+  const commitAll = f.worktrees.commitAll;
+  const runningAtCommit: number[] = [];
+  f.worktrees.commitAll = async (...args) => {
+    runningAtCommit.push(running);
+    return commitAll(...args);
+  };
+  try {
+    const text = 'Finish before recording.\nFAKE: sleep 300\nFAKE: write accepted.txt finished';
+    await f.office.sendMessage({ to: agent.name, text });
+    assert.equal(fail, false);
+    assert.equal(f.registry.get(agent.name)!.status, 'running');
+    assert.deepEqual(f.registry.get(agent.name)!.queued_messages, [text]);
+    const reports = await f.drain();
+    assert.equal(reports.length, 2, 'retained messages may be delivered again after the accepted turn finishes');
+    assert.equal(reports[0]!.result?.summary, `fake turn 2 of session ${session}`);
+    assert.equal(reports[0]!.facts.exit_code, 0);
+    assert.equal(reports[0]!.facts.cancelled, false);
+    assert.match(reports[0]!.facts.error!, /Cannot clear queued messages: disk full during queue clear/);
+    assert.ok(reports[0]!.facts.commit);
+    assert.equal(await git(agent.worktree, 'show', `${reports[0]!.facts.commit}:accepted.txt`), 'finished');
+    assert.equal(reports[1]!.result?.summary, `fake turn 3 of session ${session}`);
+    assert.equal(reports[1]!.facts.error, undefined);
+    assert.deepEqual(runningAtCommit, [0, 0]);
+    assert.equal(peakRunning, 1, 'the same session must never have overlapping processes');
+    assert.equal(running, 0, 'every accepted process must have resolved done before wait reports completion');
+    assert.equal(f.registry.get(agent.name)!.status, 'idle');
+    assert.deepEqual(f.registry.get(agent.name)!.queued_messages, []);
+  } finally {
+    await Promise.all(f.started.map(({ turn }) => turn.done));
+  }
+});
+
 test('auto-commit messages use only the first 100 characters of the first summary line', async (t) => {
   const f = await fixture(t);
   const startTurn = f.engine.startTurn;

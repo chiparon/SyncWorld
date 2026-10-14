@@ -166,7 +166,11 @@ export function createPostOffice(opts: PostOfficeOptions): PostOffice {
           timeout_ms: limits.turn_timeout_ms,
         });
         // A failed launch has not delivered anything; the first turn cannot deliver messages either.
-        if (!first) registry.update(name, { queued_messages: [] });
+        if (!first) {
+          // Once launched, a persistence failure must not let us stop awaiting the process.
+          try { registry.update(name, { queued_messages: [] }); }
+          catch (error) { errors.push(`Cannot clear queued messages: ${errorMessage(error)}`); }
+        }
         const sessionSaved = active.handle.sessionId.then((session_id) => {
           if (session_id !== undefined && registry.get(name)?.session_id === undefined) {
             registry.update(name, { session_id });
