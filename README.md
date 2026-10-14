@@ -83,7 +83,7 @@ worker 的角色可以套用 `roles/` 里的模板（`engineer`、`architect`、
 | `SYNCW_RUNS_DIR` | `runs/` | 运行记录放在哪里 |
 | `SYNCW_CODEX_COMMAND` | 自动查找 | 启动 codex 的命令，格式是 JSON 数组 |
 
-post office 重启后，默认接着当前仓库最近一次尚未结束的运行：之前正在跑的 worker 会被标记为“中断”，之后可以用 `send_message` 续接。健康检查（如 `claude mcp list`）或第二个会话不会打扰仍在运行的 post office；没有雇人就不会创建新的运行目录。用 `--new-run` 可以另起一轮；如果上一次的 agent 都已关闭，也会自动另起一轮。
+post office 重启后，默认接着当前仓库最近一次尚未结束的运行：之前正在跑的 worker 会被标记为"中断"，之后可以用 `send_message` 续接。健康检查（如 `claude mcp list`）或第二个会话不会打扰仍在运行的 post office；没有雇人就不会创建新的运行目录。用 `--new-run` 可以另起一轮；如果上一次的 agent 都已关闭，也会自动另起一轮。
 
 ## 安全
 
