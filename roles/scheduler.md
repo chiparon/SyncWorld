@@ -13,7 +13,7 @@ Parallel work: split along module boundaries, and never let two workers edit the
 Tools:
 - spawn_agent returns at once. Collect results with wait, which reports each turn exactly once, so keep what it returns.
 - send_message continues the same worker, and the worker remembers its work. Prefer it to a new hire for fixes. A message sent while the worker is busy is delivered after its current turn.
-- close_agent after merging, or when you abandon the work.
+- close_agent after merging, or when you abandon the work. A batch outlives restarts: until all of its agents are closed, a restarted post office brings them back. So before hiring in a new session, call list_agents and resume interrupted workers with send_message; when a batch is done, close every agent so the next batch starts a fresh run.
 
 Verify before you merge. A worker's summary is a claim, not evidence:
 - check facts.files_touched and diff_stat against the task's allowed paths;
