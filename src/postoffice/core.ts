@@ -233,8 +233,9 @@ export function createPostOffice(opts: PostOfficeOptions): PostOffice {
       brief = readFileSync(join(opts.roles_dir, `${role}.md`), 'utf8');
       if (input.brief !== undefined) brief += `\n\n${input.brief}`;
     }
-    const name = registry.allocateName(role);
     const repo = resolve(input.repo ?? opts.default_repo);
+    // Branches and worktrees outlive runs, and run names restart at 1.
+    const name = registry.allocateName(role, await worktrees.usedNames(repo));
     const created = await worktrees.create(repo, name, input.base);
     const record: AgentRecord = {
       name, role, brief, task: input.task, engine: engine.kind, hired_by: 'scheduler', repo,
@@ -343,6 +344,10 @@ export function createPostOffice(opts: PostOfficeOptions): PostOffice {
       } finally {
         closing.delete(name);
       }
+    },
+    // Placeholder until the run lifecycle lands.
+    async shutdown() {
+      throw new Error('shutdown is not implemented yet.');
     },
   };
 }

@@ -78,5 +78,9 @@ export function createWorktrees(opts: { git?: string } = {}): Worktrees {
         }
       }
     },
+    // Placeholder until the names task lands: no names are reserved yet.
+    async usedNames() {
+      return new Set<string>();
+    },
   };
 }

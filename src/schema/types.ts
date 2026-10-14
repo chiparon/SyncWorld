@@ -113,7 +113,11 @@ export type AgentStatus = 'queued' | 'running' | 'idle' | 'cancelled' | 'interru
 export type EngineKind = 'codex';
 
 export interface AgentRecord {
-  /** `<role>-<n>`, unique within a run, e.g. "engineer-1". */
+  /**
+   * `<role>-<n>`, e.g. "engineer-1". Unique within its run, and never the name
+   * of a `syncw/<name>` branch or worktree directory that already existed in
+   * its repository (see Worktrees.usedNames).
+   */
   name: string;
   /** Template name from roles/, or "custom" when only a brief was given. */
   role: string;
@@ -135,7 +139,11 @@ export interface AgentRecord {
   session_id?: string;
   status: AgentStatus;
   turns: TurnRecord[];
-  /** Messages received while a turn was running; delivered together as the next turn. */
+  /**
+   * Messages not delivered yet, oldest first. The next follow-up turn delivers
+   * all of them together, and they stay here until that turn starts, so a
+   * restart of the post office cannot lose them.
+   */
   queued_messages: string[];
   /** ISO-8601. */
   created_at: string;
@@ -223,19 +231,49 @@ export interface Worktrees {
   ): Promise<CommitInfo | undefined>;
   /** Force-removes the worktree; optionally deletes a branch too. */
   remove(repo: string, worktree: string, opts?: { deleteBranch?: string }): Promise<void>;
+  /**
+   * Every name `create` would refuse in this repository: the `<name>` of each
+   * branch `syncw/<name>`, and each entry of the `<repo name>.worktrees/`
+   * directory (none when it does not exist). `repo` may be any path inside the
+   * repository, as for `create`. Agent numbers restart at 1 in every run, but
+   * branches and worktrees outlive runs, so new names are allocated around these.
+   */
+  usedNames(repo: string): Promise<Set<string>>;
 }
 
 // ---------------------------------------------------------------------------
 // Registry: the post office's memory, persisted under runs/<run-id>/ (DESIGN §8).
 // Implemented by src/postoffice/registry.ts.
+//
+// A run is one batch of work, and it can outlive the post office that started
+// it: a restarted post office continues its repository's unfinished run (see
+// OpenRegistryOptions), so the scheduler finds its agents again.
+//
+// A new run exists only in memory until its first write (add, update,
+// appendTurn, agentDir or log). A post office that never hires anyone, such as
+// one started by `claude mcp list` to check health, leaves nothing on disk.
+//
+// Ownership. At most one post office uses a run at a time: two processes
+// writing one agents.json lose each other's updates, and a newcomer would mark
+// the live owner's running agents interrupted. The claim is a file
+// runs/<run-id>/owner-<pid>.json holding {"pid", "started_at"}. A post office
+// writes it when it continues a run, or when it creates one (before
+// agents.json), and close() removes it. A claim is live when its pid is not
+// this process's own and process.kill(pid, 0) succeeds or fails with EPERM;
+// any other claim is stale and may be deleted. To claim a run, write your own
+// file, then look for another live claim; if there is one, delete your own
+// file and give up. Two post offices racing for one run may both give up, but
+// never both win. A dead owner whose pid was reused looks live, which errs on
+// the safe side: the newcomer starts a new run.
 // ---------------------------------------------------------------------------
 
 export interface Registry {
+  /** Fixed when the registry opens, also for a new run that is not on disk yet. */
   readonly runId: string;
   /** Absolute path of runs/<run-id>. */
   readonly runDir: string;
-  /** "<role>-<n>" with the smallest n not yet used in this run. */
-  allocateName(role: string): string;
+  /** "<role>-<n>" with the smallest n such that the name is neither used in this run nor in `taken`. */
+  allocateName(role: string, taken?: ReadonlySet<string>): string;
   /** Adds and persists. Throws if the name is taken. */
   add(record: AgentRecord): void;
   get(name: string): AgentRecord | undefined;
@@ -248,17 +286,38 @@ export interface Registry {
   agentDir(name: string): string;
   /** Appends {"ts", "event", ...data} as one line to runs/<run-id>/log.jsonl. */
   log(event: string, data?: Record<string, unknown>): void;
+  /**
+   * Releases this post office's claim on the run, if it holds one. Idempotent.
+   * Call it last: the registry must not be written afterwards.
+   */
+  close(): void;
 }
 
 export interface OpenRegistryOptions {
   /** The directory holding all runs, e.g. <syncw>/runs. */
   runsDir: string;
   /**
-   * Reopen the newest existing run instead of starting a new one. Agents that
-   * were queued or running are marked interrupted, because their processes
-   * did not survive the restart.
+   *   continue  (default) Continue this repository's latest run if one of its
+   *             agents is not closed and no live post office owns it.
+   *             Otherwise start a new run.
+   *   new       Always start a new run.
+   *
+   * This repository's latest run is the newest run whose agents.json lists an
+   * agent working in `repo` (any agent at all when `repo` is absent), with runs
+   * ordered by id as in `syncw status`. Older runs are never continued.
+   * Continuing a run marks its queued and running agents interrupted, because
+   * their processes did not survive the restart, and logs "registry.reopened"
+   * with their names.
    */
-  reopenLatest?: boolean;
+  mode?: 'continue' | 'new';
+  /**
+   * The post office's default repository. An agent works in it when its
+   * AgentRecord.repo is the same path, compared after path.resolve and
+   * case-insensitively on Windows. Every repository shares one runs
+   * directory, so without this a post office could continue another
+   * project's run.
+   */
+  repo?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -360,11 +419,33 @@ export interface PostOfficeOptions {
 
 export interface PostOffice {
   spawnAgent(input: SpawnAgentInput): Promise<SpawnAgentOutput>;
+  /**
+   * While the agent is queued or running, the text joins queued_messages for
+   * its next turn. Otherwise it starts a turn, or queues one behind
+   * max_parallel: a follow-up in the agent's session that delivers every
+   * queued message, oldest first, or, when the agent's first turn never
+   * started, that first turn, with the messages delivered in the turn after.
+   * Throws for an agent that has finished turns but no session to resume.
+   */
   sendMessage(input: SendMessageInput): Promise<SendMessageOutput>;
   wait(input: WaitInput): Promise<WaitOutput>;
   listAgents(): AgentSummary[];
   cancelAgent(name: string): Promise<void>;
   closeAgent(name: string, opts?: { delete_branch?: boolean }): Promise<void>;
+  /**
+   * Stops the post office for good, when the MCP client disconnects or the
+   * process is asked to stop. No Codex process may outlive its post office,
+   * because the next one would resume the same session in the same worktree.
+   *
+   * Once called, spawnAgent and sendMessage throw, and no new turn starts.
+   * Queued agents become interrupted. Running turns are cancelled, then
+   * recorded as usual, auto-commit included, with a facts.error saying that
+   * the post office shut down; their agents end interrupted, not cancelled.
+   * Queued messages stay queued. Pending wait calls reject without marking any
+   * turn reported, so the next post office reports those turns. Resolves once
+   * every running turn is recorded. Idempotent.
+   */
+  shutdown(): Promise<void>;
 }
 
 // ---------------------------------------------------------------------------

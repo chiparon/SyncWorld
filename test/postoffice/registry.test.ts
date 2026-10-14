@@ -110,7 +110,7 @@ test('records and turns survive reopening the same run', (t) => {
   assert.deepEqual(updated.turns, [first, second]);
   assert.deepEqual(saved(registry), [updated]);
 
-  const reopened = openRegistry({ runsDir, reopenLatest: true });
+  const reopened = openRegistry({ runsDir, mode: 'continue' });
   assert.equal(reopened.runId, registry.runId);
   assert.equal(reopened.runDir, registry.runDir);
   assert.deepEqual(reopened.get(record.name), updated);
@@ -146,7 +146,7 @@ test('reopenLatest interrupts only queued and running agents, persists, and logs
   const statuses: AgentRecord['status'][] = ['running', 'queued', 'idle', 'cancelled', 'interrupted', 'closed'];
   statuses.forEach((status, index) => registry.add(agent(`engineer-${index + 1}`, status)));
 
-  const reopened = openRegistry({ runsDir, reopenLatest: true });
+  const reopened = openRegistry({ runsDir, mode: 'continue' });
   assert.deepEqual(reopened.list().map((record) => record.status), [
     'interrupted', 'interrupted', 'idle', 'cancelled', 'interrupted', 'closed',
   ]);
@@ -168,7 +168,7 @@ test('reopenLatest selects by name and ignores directories without state and ord
   mkdirSync(join(runsDir, '20261014-120000-aaaa'));
   writeFileSync(join(runsDir, '20261015-120000-aaaa'), 'not a directory');
 
-  const registry = openRegistry({ runsDir, reopenLatest: true });
+  const registry = openRegistry({ runsDir, mode: 'continue' });
   assert.equal(registry.runId, newer);
   assert.deepEqual(registry.list(), [agent('engineer-2')]);
   const event = JSON.parse(readFileSync(join(registry.runDir, 'log.jsonl'), 'utf8').trim());
@@ -177,7 +177,7 @@ test('reopenLatest selects by name and ignores directories without state and ord
 
 test('reopenLatest starts a new run when no previous state exists', (t) => {
   const runsDir = join(temporaryDirectory(t), 'runs');
-  const registry = openRegistry({ runsDir, reopenLatest: true });
+  const registry = openRegistry({ runsDir, mode: 'continue' });
   assert.deepEqual(saved(registry), []);
   assert.match(registry.runId, /^\d{8}-\d{6}-[a-z0-9]{4}$/);
 });
@@ -193,7 +193,7 @@ test('allocateName fills gaps, does not reserve names, and never reuses closed n
   registry.update('engineer-2', { status: 'closed' });
   assert.equal(registry.allocateName('engineer'), 'engineer-3');
   assert.equal(registry.allocateName('reviewer'), 'reviewer-1');
-  assert.equal(openRegistry({ runsDir, reopenLatest: true }).allocateName('engineer'), 'engineer-3');
+  assert.equal(openRegistry({ runsDir, mode: 'continue' }).allocateName('engineer'), 'engineer-3');
 });
 
 test('duplicate names are rejected without overwriting existing records', (t) => {

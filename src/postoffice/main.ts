@@ -61,7 +61,8 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
   }
   const instructions = readFileSync(join(root, 'roles', 'scheduler.md'), 'utf8');
   const engine = createCodexEngine();
-  const registry = openRegistry({ runsDir: options.runsDir, reopenLatest: options.reopenLatest });
+  // Placeholder until the run lifecycle lands: --reopen still selects the old behavior.
+  const registry = openRegistry({ runsDir: options.runsDir, mode: options.reopenLatest ? 'continue' : 'new' });
   const po = createPostOffice({
     registry,
     worktrees: createWorktrees(),

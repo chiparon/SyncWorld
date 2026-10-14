@@ -25,7 +25,8 @@ export function openRegistry(opts: OpenRegistryOptions): Registry {
   const runsDir = resolve(opts.runsDir);
   mkdirSync(runsDir, { recursive: true });
 
-  let runId = opts.reopenLatest
+  // Placeholder until the run lifecycle lands: 'continue' reopens the newest run with state.
+  let runId = opts.mode === 'continue'
     ? readdirSync(runsDir, { withFileTypes: true })
         .filter((entry) => entry.isDirectory() && existsSync(join(runsDir, entry.name, 'agents.json')))
         .map((entry) => entry.name)
@@ -72,9 +73,10 @@ export function openRegistry(opts: OpenRegistryOptions): Registry {
   const registry: Registry = {
     runId,
     runDir,
-    allocateName(role) {
+    allocateName(role, taken) {
+      const used = (name: string) => records.some((agent) => agent.name === name) || taken?.has(name) === true;
       let number = 1;
-      while (records.some((agent) => agent.name === `${role}-${number}`)) number++;
+      while (used(`${role}-${number}`)) number++;
       return `${role}-${number}`;
     },
     add(record) {
@@ -112,6 +114,8 @@ export function openRegistry(opts: OpenRegistryOptions): Registry {
         `${JSON.stringify({ ts: new Date().toISOString(), event, ...data })}\n`,
       );
     },
+    // Placeholder until the run lifecycle lands: there is no claim to release yet.
+    close() {},
   };
 
   const interrupted = records
