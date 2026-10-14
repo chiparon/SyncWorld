@@ -175,6 +175,7 @@ worker 沿用你的 Codex 配置（`~/.codex/config.toml`），包括模型 `gpt
   - `agents.json`：所有 agent 的状态
   - `<agent 名>/events.jsonl`：Codex 的完整事件流
   - `<agent 名>/turn-<n>.json`：每一轮的结果
+  - `owner-<进程号>.json`：正在使用这次运行的 post office；它退出时会删掉这个文件
 - **在 git 里**：每个 worker 一个分支，每一轮一个 commit。
 
 ---
