@@ -184,11 +184,8 @@ test('stdio server runs, commits, resumes, closes an agent, and reopens its regi
   // Omitting --repo also exercises the launch directory default.
   const reopened = await connect(env, repo, ['--reopen']);
   try {
-    const agents = await call<AgentSummary[]>(reopened.client, 'list_agents');
-    assert.equal(agents.length, 1);
-    assert.equal(agents[0]?.name, name);
-    assert.equal(agents[0]?.status, 'closed');
-    assert.equal(agents[0]?.turns, 2);
+    // Every agent of the latest run is closed, so the batch is over: a new, still-lazy run starts.
+    assert.deepEqual(await call<AgentSummary[]>(reopened.client, 'list_agents'), []);
     assert.equal(readdirSync(env.SYNCW_RUNS_DIR).length, 1);
     assert.deepEqual(reopened.errors, []);
     assert.equal(reopened.stderr(), '');
