@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join, relative, resolve } from 'node:path';
 import { test } from 'node:test';
 import type { TestContext } from 'node:test';
+import { setTimeout as sleep } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 
@@ -13,11 +14,25 @@ import { createPostOffice, DEFAULT_LIMITS } from '../../src/postoffice/core.ts';
 import { buildFirstPrompt, buildFollowUpPrompt } from '../../src/postoffice/prompt.ts';
 import { openRegistry } from '../../src/postoffice/registry.ts';
 import { createWorktrees } from '../../src/postoffice/worktrees.ts';
-import type { Engine, EngineTurnRequest, PostOfficeLimits, RunningTurn, TurnReport } from '../../src/schema/types.ts';
+import type { AgentRecord, Engine, EngineTurnRequest, PostOfficeLimits, RunningTurn, TurnReport } from '../../src/schema/types.ts';
 
 const execute = promisify(execFile);
 const fake = fileURLToPath(new URL('../fake-codex/codex.ts', import.meta.url));
 const schema = fileURLToPath(new URL('../../src/schema/result.schema.json', import.meta.url));
+
+function signal() {
+  let resolve!: () => void;
+  const promise = new Promise<void>((done) => { resolve = done; });
+  return { promise, resolve };
+}
+
+async function until(check: () => boolean): Promise<void> {
+  const deadline = Date.now() + 5000;
+  while (!check()) {
+    assert.ok(Date.now() < deadline, 'condition must become true within the test timeout');
+    await sleep(10);
+  }
+}
 
 async function git(repo: string, ...args: string[]): Promise<string> {
   return (await execute('git', ['-c', 'core.quotepath=false', '-C', repo, ...args], {
@@ -49,19 +64,14 @@ async function fixture(t: TestContext, limits: Partial<PostOfficeLimits> = {}) {
     limits,
   };
   const office = createPostOffice(options);
+  const offices = [office];
+  function restart() {
+    const next = createPostOffice(options);
+    offices.push(next);
+    return next;
+  }
   t.after(async () => {
-    // Stop pending follow-ups before cancelling running processes and removing their files.
-    for (const record of registry.list()) {
-      registry.update(record.name, { queued_messages: [] });
-      if (record.status === 'queued') await office.cancelAgent(record.name);
-    }
-    for (const record of registry.list()) {
-      if (record.status === 'running') await office.cancelAgent(record.name);
-    }
-    await Promise.all(started.map(({ turn }) => turn.done));
-    while (office.listAgents().some((record) => record.status === 'running' || record.status === 'queued')) {
-      await office.wait({ timeout_s: 10 });
-    }
+    for (const current of offices) await current.shutdown();
     assert.equal(dirname(resolve(root)), resolve(tmpdir()));
     rmSync(root, { recursive: true, force: true });
   });
@@ -82,16 +92,16 @@ async function fixture(t: TestContext, limits: Partial<PostOfficeLimits> = {}) {
   await git(repo, 'commit', '-m', 'Initial commit');
   const base = await git(repo, 'rev-parse', 'HEAD');
 
-  async function drain(): Promise<TurnReport[]> {
+  async function drain(current = office): Promise<TurnReport[]> {
     const reports: TurnReport[] = [];
     for (;;) {
-      const output = await office.wait({ timeout_s: 15 });
+      const output = await current.wait({ timeout_s: 15 });
       reports.push(...output.finished);
       if (!output.pending.length) return reports;
       assert.ok(output.finished.length, 'agents must finish within the test timeout');
     }
   }
-  return { root, repo, roles, home, hooks, base, registry, worktrees, engine, started, options, office, drain };
+  return { root, repo, roles, home, hooks, base, registry, worktrees, engine, started, options, office, restart, drain };
 }
 
 test('spawn and wait persist the prompt, result, measured facts and an authored auto-commit', async (t) => {
@@ -229,7 +239,7 @@ test('max_agents includes closed agents and concurrent spawn calls cannot share 
   if (results[2]!.status === 'rejected') assert.match(String(results[2]!.reason), /max_agents \(2\)/);
   await f.drain();
   await f.office.closeAgent(agents[0]!.name, { delete_branch: true });
-  await assert.rejects(f.office.spawnAgent(inputs), /max_agents \(2\).*closed agents/);
+  await assert.rejects(f.office.spawnAgent(inputs), /max_agents \(2\).*closed agents.*close this run's remaining agents and restart the post office, or start it with --new-run/);
 });
 
 test('max_turns counts queued and running turns and allows bundled messages for the final turn', async (t) => {
@@ -274,9 +284,15 @@ test('cancelling a running turn keeps its partial commit and stops automatic que
   assert.equal(f.registry.get(agent.name)!.status, 'cancelled');
   assert.equal(f.started.length, 1);
   await f.office.cancelAgent(agent.name);
+  assert.deepEqual(f.registry.get(agent.name)!.queued_messages, ['Do not start automatically.']);
+  await f.office.sendMessage({ to: agent.name, text: 'Now deliver everything.' });
+  await f.drain();
+  assert.equal(f.registry.get(agent.name)!.turns[1]!.input,
+    buildFollowUpPrompt(['Do not start automatically.', 'Now deliver everything.'], 'scheduler'));
+  assert.deepEqual(f.registry.get(agent.name)!.queued_messages, []);
 });
 
-test('queued cancellation creates no turn, wakes waits and has no session to resume', async (t) => {
+test('queued cancellation creates no turn, wakes waits and sendMessage restarts the first turn', async (t) => {
   const f = await fixture(t, { max_parallel: 1 });
   const first = await f.office.spawnAgent({ brief: 'Role', task: { goal: 'Wait.\nFAKE: sleep 30000' } });
   const second = await f.office.spawnAgent({ brief: 'Role', task: { goal: 'Queued.' } });
@@ -288,10 +304,16 @@ test('queued cancellation creates no turn, wakes waits and has no session to res
   assert.deepEqual(f.registry.get(second.name)!.turns, []);
   assert.equal(f.registry.get(second.name)!.status, 'cancelled');
   assert.equal(f.started.length, 1);
-  await assert.rejects(f.office.sendMessage({ to: second.name, text: 'Continue' }), /nothing to resume.*first turn never started/);
+  assert.equal(f.registry.get(second.name)!.session_id, undefined);
+  assert.equal((await f.office.sendMessage({ to: second.name, text: 'Continue' })).delivery, 'queued');
+  assert.deepEqual(f.registry.get(second.name)!.queued_messages, ['Continue']);
   await f.office.cancelAgent(first.name);
   await f.drain();
-  assert.equal(f.started.length, 1);
+  assert.equal(f.started.length, 3);
+  const record = f.registry.get(second.name)!;
+  assert.equal(record.turns[0]!.input, buildFirstPrompt(record));
+  assert.equal(record.turns[1]!.input, buildFollowUpPrompt(['Continue'], 'scheduler'));
+  assert.deepEqual(record.queued_messages, []);
 });
 
 test('cancelled and interrupted agents resume their original session', async (t) => {
@@ -326,6 +348,172 @@ test('an idle agent follow-up queues behind an occupied slot and resumes when it
   await f.office.cancelAgent(busy.name);
   const reports = await f.drain();
   assert.equal(reports.find((report) => report.agent === first.name)!.result?.summary, `fake turn 2 of session ${session}`);
+});
+
+for (const status of ['idle', 'cancelled', 'interrupted'] as const) {
+  test(`messages to an ${status} agent stay durable until its queued follow-up starts, including after restart`, async (t) => {
+    const f = await fixture(t, { max_parallel: 1 });
+    const agent = await f.office.spawnAgent({ brief: 'Role', task: { goal: 'Finish.' } });
+    await f.drain();
+    f.registry.update(agent.name, { status });
+    await f.office.spawnAgent({ brief: 'Role', task: { goal: 'Wait.\nFAKE: sleep 30000' } });
+    const messages = ['Oldest message.', 'Second message.'];
+    for (const text of messages) {
+      assert.equal((await f.office.sendMessage({ to: agent.name, text })).delivery, 'queued');
+    }
+    function persisted() {
+      const records = JSON.parse(readFileSync(join(f.registry.runDir, 'agents.json'), 'utf8')) as AgentRecord[];
+      return records.find((record) => record.name === agent.name)!;
+    }
+    assert.equal(persisted().status, 'queued');
+    assert.deepEqual(persisted().queued_messages, messages);
+    assert.deepEqual(f.registry.get(agent.name)!.queued_messages, messages);
+    await f.office.shutdown();
+    assert.equal(persisted().status, 'interrupted');
+    assert.deepEqual(persisted().queued_messages, messages);
+
+    const next = f.restart();
+    const startTurn = f.engine.startTurn;
+    f.engine.startTurn = (request) => {
+      assert.deepEqual(persisted().queued_messages, []);
+      assert.equal(request.prompt, buildFollowUpPrompt([...messages, 'Newest message.'], 'scheduler'));
+      return startTurn(request);
+    };
+    assert.equal((await next.sendMessage({ to: agent.name, text: 'Newest message.' })).delivery, 'started');
+    await f.drain(next);
+    assert.equal(f.registry.get(agent.name)!.turns.length, 2);
+  });
+}
+
+test('automatic follow-ups retain messages while queued and include later messages when their slot opens', async (t) => {
+  const f = await fixture(t, { max_parallel: 1 });
+  const commitAll = f.worktrees.commitAll;
+  const gate = signal();
+  f.worktrees.commitAll = async (...args) => { await gate.promise; return commitAll(...args); };
+  try {
+    const agent = await f.office.spawnAgent({ brief: 'Role', task: { goal: 'Finish.' } });
+    const busy = await f.office.spawnAgent({ brief: 'Role', task: { goal: 'Wait.\nFAKE: sleep 30000' } });
+    await f.office.sendMessage({ to: agent.name, text: 'First.' });
+    gate.resolve();
+    await f.office.wait({ agents: [agent.name] });
+    assert.equal(f.registry.get(agent.name)!.status, 'queued');
+    assert.deepEqual(f.registry.get(agent.name)!.queued_messages, ['First.']);
+    await f.office.sendMessage({ to: agent.name, text: 'Second.' });
+    await f.office.cancelAgent(busy.name);
+    await f.drain();
+    const record = f.registry.get(agent.name)!;
+    assert.equal(record.turns.length, 2);
+    assert.equal(record.turns[1]!.input, buildFollowUpPrompt(['First.', 'Second.'], 'scheduler'));
+    assert.deepEqual(record.queued_messages, []);
+  } finally {
+    gate.resolve();
+  }
+});
+
+test('shutdown interrupts running and queued agents, commits partial work and preserves unreported turns and messages', async (t) => {
+  const f = await fixture(t, { max_parallel: 1 });
+  const active = await f.office.spawnAgent({ brief: 'Role', task: { goal: 'Write then wait.\nFAKE: write partial.txt saved\nFAKE: sleep 30000' } });
+  const queued = await f.office.spawnAgent({ brief: 'Role', task: { goal: 'First turn still needed.' } });
+  await until(() => existsSync(join(active.worktree, 'partial.txt')));
+  await f.office.sendMessage({ to: active.name, text: 'Retain this running message.' });
+  await f.office.sendMessage({ to: queued.name, text: 'Retain this queued message.' });
+  const waitRejected = assert.rejects(f.office.wait({}), /post office is shutting down/);
+  const commitAll = f.worktrees.commitAll;
+  const committing = signal();
+  const gate = signal();
+  f.worktrees.commitAll = async (...args) => {
+    committing.resolve();
+    await gate.promise;
+    return commitAll(...args);
+  };
+  let cancellations = 0;
+  const handle = f.started[0]!.turn;
+  const cancel = handle.cancel;
+  handle.cancel = () => { cancellations++; cancel(); };
+  try {
+    let resolved = false;
+    const stopping = f.office.shutdown().then(() => { resolved = true; });
+    const alsoStopping = f.office.shutdown();
+    await waitRejected;
+    await committing.promise;
+    assert.equal(resolved, false, 'shutdown must await the auto-commit and turn record');
+    assert.equal(cancellations, 1);
+    assert.equal(f.registry.get(queued.name)!.status, 'interrupted');
+    assert.deepEqual(f.registry.get(active.name)!.turns, []);
+    await assert.rejects(f.office.spawnAgent({ brief: 'Role', task: { goal: 'No new work.' } }), /post office is shutting down/);
+    await assert.rejects(f.office.sendMessage({ to: active.name, text: 'No new message.' }), /post office is shutting down/);
+    await assert.rejects(f.office.wait({ timeout_s: 0 }), /post office is shutting down/);
+    gate.resolve();
+    await Promise.all([stopping, alsoStopping]);
+    await f.office.shutdown();
+    assert.equal(cancellations, 1);
+    assert.equal(f.started.length, 1);
+    const record = f.registry.get(active.name)!;
+    assert.equal(record.status, 'interrupted');
+    assert.deepEqual(record.queued_messages, ['Retain this running message.']);
+    assert.equal(record.turns.length, 1);
+    const turn = record.turns[0]!;
+    assert.equal(turn.reported, false);
+    assert.equal(turn.facts.cancelled, true);
+    assert.match(turn.facts.error!, /The post office shut down during the turn\./);
+    assert.ok(turn.facts.commit);
+    assert.equal(await git(active.worktree, 'show', `${turn.facts.commit}:partial.txt`), 'saved');
+    assert.deepEqual(f.registry.get(queued.name)!.turns, []);
+    assert.deepEqual(f.registry.get(queued.name)!.queued_messages, ['Retain this queued message.']);
+    await assert.rejects(f.office.wait({}), /post office is shutting down/);
+
+    const next = f.restart();
+    const report = await next.wait({ timeout_s: 0 });
+    assert.deepEqual(report.finished, [{ agent: active.name, turn: 1, result: turn.result, facts: turn.facts }]);
+    assert.deepEqual(report.pending, []);
+    assert.deepEqual(await next.wait({ timeout_s: 0 }), { finished: [], pending: [] });
+    const startTurn = f.engine.startTurn;
+    f.engine.startTurn = (request) => {
+      if (request.session_id === undefined) {
+        assert.equal(request.prompt, buildFirstPrompt(f.registry.get(queued.name)!));
+        assert.deepEqual(f.registry.get(queued.name)!.queued_messages, ['Retain this queued message.', 'Resume first turn.']);
+      }
+      return startTurn(request);
+    };
+    assert.equal((await next.sendMessage({ to: queued.name, text: 'Resume first turn.' })).delivery, 'started');
+    await f.drain(next);
+    const resumed = f.registry.get(queued.name)!;
+    assert.equal(resumed.turns.length, 2);
+    assert.equal(resumed.turns[1]!.input, buildFollowUpPrompt(['Retain this queued message.', 'Resume first turn.'], 'scheduler'));
+    assert.deepEqual(resumed.queued_messages, []);
+  } finally {
+    gate.resolve();
+  }
+});
+
+test('shutdown waits for an in-flight spawn and leaves its created agent interrupted', async (t) => {
+  const f = await fixture(t);
+  const create = f.worktrees.create;
+  const created = signal();
+  const gate = signal();
+  f.worktrees.create = async (...args) => {
+    const info = await create(...args);
+    created.resolve();
+    await gate.promise;
+    return info;
+  };
+  try {
+    const spawning = f.office.spawnAgent({ brief: 'Role', task: { goal: 'Do not start.' } });
+    const queuedSpawn = assert.rejects(f.office.spawnAgent({ brief: 'Role', task: { goal: 'Do not create.' } }), /post office is shutting down/);
+    await created.promise;
+    const stopping = f.office.shutdown();
+    gate.resolve();
+    const agent = await spawning;
+    await Promise.all([stopping, queuedSpawn]);
+    assert.equal(agent.status, 'interrupted');
+    assert.equal(f.registry.list().length, 1);
+    assert.equal(f.registry.get(agent.name)!.status, 'interrupted');
+    assert.deepEqual(f.registry.get(agent.name)!.turns, []);
+    assert.equal(f.started.length, 0);
+    await f.office.shutdown();
+  } finally {
+    gate.resolve();
+  }
 });
 
 test('wait filters agents, times out with pending names, and returns immediately when nothing can finish', async (t) => {
