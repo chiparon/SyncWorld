@@ -1,4 +1,7 @@
 import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
+import { once } from 'node:events';
+import fs from 'node:fs';
 import {
   existsSync,
   linkSync,
@@ -11,6 +14,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
+import { syncBuiltinESMExports } from 'node:module';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { test } from 'node:test';
 import type { TestContext } from 'node:test';
@@ -69,7 +73,36 @@ function saved(registry: Registry): AgentRecord[] {
   return JSON.parse(readFileSync(join(registry.runDir, 'agents.json'), 'utf8'));
 }
 
-test('a new run has a local-time ID, an absolute directory, and empty state', (t) => {
+function seedRun(runsDir: string, id: string, agents: AgentRecord[]): string {
+  const runDir = join(runsDir, id);
+  mkdirSync(runDir, { recursive: true });
+  writeFileSync(join(runDir, 'agents.json'), JSON.stringify(agents));
+  return runDir;
+}
+
+async function liveOwner(t: TestContext, directory: string) {
+  const script = join(directory, 'owner.cjs');
+  writeFileSync(script, "setInterval(() => {}, 60_000); process.send('ready');");
+  const child = spawn(process.execPath, [script], { stdio: ['ignore', 'ignore', 'ignore', 'ipc'] });
+  t.after(async () => {
+    if (child.exitCode === null && child.signalCode === null) {
+      const exited = once(child, 'exit');
+      child.kill();
+      await exited;
+    }
+  });
+  await once(child, 'message');
+  assert.ok(child.pid);
+  return child;
+}
+
+function ownerClaim(runDir: string, pid: number): string {
+  const file = join(runDir, `owner-${pid}.json`);
+  writeFileSync(file, JSON.stringify({ pid, started_at: '2026-10-13T00:00:00.000Z' }));
+  return file;
+}
+
+test('opening, reading and allocating a name are lazy; the first add creates state and a claim', (t) => {
   const runsDir = join(temporaryDirectory(t), 'runs');
   const before = new Date();
   const registry = openRegistry({ runsDir: relative(process.cwd(), runsDir) });
@@ -85,15 +118,23 @@ test('a new run has a local-time ID, an absolute directory, and empty state', (t
   assert.ok(localDate.getTime() <= after.getTime());
   assert.equal(registry.runDir, join(runsDir, registry.runId));
   assert.ok(isAbsolute(registry.runDir));
-  assert.ok(statSync(registry.runDir).isDirectory());
-  assert.deepEqual(saved(registry), []);
+  assert.deepEqual(registry.list(), []);
+  assert.equal(registry.get('missing'), undefined);
+  assert.equal(registry.allocateName('engineer'), 'engineer-1');
+  assert.equal(registry.allocateName('engineer', new Set(['engineer-1'])), 'engineer-2');
+  assert.equal(existsSync(runsDir), false);
+  registry.add(agent());
+  assert.deepEqual(saved(registry), [agent()]);
+  const claim = JSON.parse(readFileSync(join(registry.runDir, `owner-${process.pid}.json`), 'utf8'));
+  assert.equal(claim.pid, process.pid);
+  assert.equal(new Date(claim.started_at).toISOString(), claim.started_at);
 
   const directory = join(registry.runDir, 'engineer-1');
   assert.equal(existsSync(directory), false);
   assert.equal(registry.agentDir('engineer-1'), directory);
   assert.equal(registry.agentDir('engineer-1'), directory);
   assert.ok(statSync(directory).isDirectory());
-  assert.notEqual(openRegistry({ runsDir }).runId, registry.runId);
+  assert.notEqual(openRegistry({ runsDir, mode: 'new' }).runId, registry.runId);
 });
 
 test('records and turns survive reopening the same run', (t) => {
@@ -110,7 +151,8 @@ test('records and turns survive reopening the same run', (t) => {
   assert.deepEqual(updated.turns, [first, second]);
   assert.deepEqual(saved(registry), [updated]);
 
-  const reopened = openRegistry({ runsDir, mode: 'continue' });
+  registry.close();
+  const reopened = openRegistry({ runsDir });
   assert.equal(reopened.runId, registry.runId);
   assert.equal(reopened.runDir, registry.runDir);
   assert.deepEqual(reopened.get(record.name), updated);
@@ -137,14 +179,15 @@ test('atomic updates replace the old file and leave pretty, valid JSON without t
     assert.equal(text, `${JSON.stringify(registry.list(), null, 2)}\n`);
     assert.deepEqual(JSON.parse(text), registry.list());
   }
-  assert.deepEqual(readdirSync(registry.runDir), ['agents.json']);
+  assert.deepEqual(readdirSync(registry.runDir).sort(), ['agents.json', `owner-${process.pid}.json`].sort());
 });
 
-test('reopenLatest interrupts only queued and running agents, persists, and logs their names', (t) => {
+test('continuing interrupts only queued and running agents, persists, and logs their names', (t) => {
   const runsDir = temporaryDirectory(t);
   const registry = openRegistry({ runsDir });
   const statuses: AgentRecord['status'][] = ['running', 'queued', 'idle', 'cancelled', 'interrupted', 'closed'];
   statuses.forEach((status, index) => registry.add(agent(`engineer-${index + 1}`, status)));
+  registry.close();
 
   const reopened = openRegistry({ runsDir, mode: 'continue' });
   assert.deepEqual(reopened.list().map((record) => record.status), [
@@ -157,7 +200,7 @@ test('reopenLatest interrupts only queued and running agents, persists, and logs
   assert.equal(new Date(event.ts).toISOString(), event.ts);
 });
 
-test('reopenLatest selects by name and ignores directories without state and ordinary files', (t) => {
+test('continue without a repo selects by name and ignores directories without state and ordinary files', (t) => {
   const runsDir = temporaryDirectory(t);
   const newer = '20261013-120000-aaaa';
   const older = '20261012-120000-zzzz';
@@ -175,10 +218,11 @@ test('reopenLatest selects by name and ignores directories without state and ord
   assert.deepEqual(event.interrupted, []);
 });
 
-test('reopenLatest starts a new run when no previous state exists', (t) => {
+test('continue starts a lazy new run when no previous state exists', (t) => {
   const runsDir = join(temporaryDirectory(t), 'runs');
   const registry = openRegistry({ runsDir, mode: 'continue' });
-  assert.deepEqual(saved(registry), []);
+  assert.deepEqual(registry.list(), []);
+  assert.equal(existsSync(runsDir), false);
   assert.match(registry.runId, /^\d{8}-\d{6}-[a-z0-9]{4}$/);
 });
 
@@ -193,7 +237,9 @@ test('allocateName fills gaps, does not reserve names, and never reuses closed n
   registry.update('engineer-2', { status: 'closed' });
   assert.equal(registry.allocateName('engineer'), 'engineer-3');
   assert.equal(registry.allocateName('reviewer'), 'reviewer-1');
-  assert.equal(openRegistry({ runsDir, mode: 'continue' }).allocateName('engineer'), 'engineer-3');
+  registry.add(agent('reviewer-1'));
+  registry.close();
+  assert.equal(openRegistry({ runsDir }).allocateName('engineer'), 'engineer-3');
 });
 
 test('duplicate names are rejected without overwriting existing records', (t) => {
@@ -266,4 +312,185 @@ test('each log call appends a single JSON line with an ISO timestamp and event d
   for (const event of events) assert.equal(new Date(event.ts).toISOString(), event.ts);
   assert.equal(events[0].prompt, 'Line one\nLine two: "你好"');
   assert.deepEqual(events[1].details, { successful: true });
+});
+
+for (const firstWrite of ['agentDir', 'log'] as const) {
+  test(`${firstWrite} also creates a lazy run with state and a claim`, (t) => {
+    const runsDir = join(temporaryDirectory(t), 'runs');
+    const registry = openRegistry({ runsDir });
+    assert.equal(existsSync(runsDir), false);
+    if (firstWrite === 'agentDir') registry.agentDir('engineer-1');
+    else registry.log('started');
+    assert.deepEqual(saved(registry), []);
+    assert.ok(existsSync(join(registry.runDir, `owner-${process.pid}.json`)));
+  });
+}
+
+test('a fixed run id collision throws without changing the existing directory', (t) => {
+  const runsDir = join(temporaryDirectory(t), 'runs');
+  const registry = openRegistry({ runsDir });
+  mkdirSync(registry.runDir, { recursive: true });
+  const file = join(registry.runDir, 'agents.json');
+  const original = JSON.stringify([agent('existing-1')]);
+  writeFileSync(file, original);
+  assert.throws(() => registry.add(agent()), /already exists.*Open a new registry.*retry/);
+  assert.equal(readFileSync(file, 'utf8'), original);
+  assert.deepEqual(readdirSync(registry.runDir), ['agents.json']);
+  assert.deepEqual(registry.list(), []);
+});
+
+test('continue selects this repo\'s newest run, ignoring newer other repos and older matching runs', (t) => {
+  const runsDir = temporaryDirectory(t);
+  const repo = join(runsDir, 'Repo');
+  const older = seedRun(runsDir, '20261012-120000-aaaa', [{ ...agent('older-1', 'running'), repo }]);
+  const selected = seedRun(runsDir, '20261013-120000-aaaa', [
+    { ...agent('other-1', 'running'), repo: join(runsDir, 'Other') },
+    { ...agent('selected-1', 'queued'), repo },
+  ]);
+  const newer = seedRun(runsDir, '20261014-120000-aaaa', [{ ...agent('newer-1', 'running'), repo: join(runsDir, 'Other') }]);
+  const before = [older, newer].map((dir) => readFileSync(join(dir, 'agents.json'), 'utf8'));
+  const resolvedRepo = join(repo, 'child', '..');
+  const registry = openRegistry({ runsDir, repo: relative(process.cwd(), process.platform === 'win32' ? resolvedRepo.toUpperCase() : resolvedRepo) });
+  assert.equal(registry.runDir, selected);
+  assert.deepEqual(registry.list().map((record) => record.status), ['interrupted', 'interrupted']);
+  assert.deepEqual([older, newer].map((dir) => readFileSync(join(dir, 'agents.json'), 'utf8')), before);
+});
+
+test('a closed latest run starts a new run instead of continuing an older unfinished run', (t) => {
+  const runsDir = temporaryDirectory(t);
+  seedRun(runsDir, '20261012-120000-aaaa', [agent('older-1', 'running')]);
+  const latest = seedRun(runsDir, '20261013-120000-aaaa', [agent('latest-1', 'closed')]);
+  const registry = openRegistry({ runsDir, repo: agent().repo });
+  assert.deepEqual(registry.list(), []);
+  assert.equal(existsSync(registry.runDir), false);
+  assert.deepEqual(readdirSync(latest), ['agents.json']);
+});
+
+test('mode new ignores an unfinished run without claiming or interrupting it', (t) => {
+  const runsDir = temporaryDirectory(t);
+  const latest = seedRun(runsDir, '20261013-120000-aaaa', [agent('engineer-1', 'running')]);
+  const before = readFileSync(join(latest, 'agents.json'), 'utf8');
+  const registry = openRegistry({ runsDir, mode: 'new' });
+  assert.deepEqual(registry.list(), []);
+  assert.equal(existsSync(registry.runDir), false);
+  assert.equal(readFileSync(join(latest, 'agents.json'), 'utf8'), before);
+  assert.deepEqual(readdirSync(latest), ['agents.json']);
+});
+
+test('a live owner forces a new run and leaves its agents and claim untouched', async (t) => {
+  const runsDir = temporaryDirectory(t);
+  const child = await liveOwner(t, runsDir);
+  seedRun(runsDir, '20261012-120000-aaaa', [agent('older-1', 'running')]);
+  const latest = seedRun(runsDir, '20261013-120000-aaaa', [agent('engineer-1', 'running')]);
+  const claim = ownerClaim(latest, child.pid!);
+  const before = [join(latest, 'agents.json'), claim].map((file) => readFileSync(file, 'utf8'));
+  const registry = openRegistry({ runsDir });
+  assert.deepEqual(registry.list(), []);
+  assert.equal(existsSync(registry.runDir), false);
+  assert.deepEqual([join(latest, 'agents.json'), claim].map((file) => readFileSync(file, 'utf8')), before);
+  assert.equal(existsSync(join(latest, `owner-${process.pid}.json`)), false);
+  assert.equal(existsSync(join(latest, 'log.jsonl')), false);
+});
+
+test('a dead owner claim is removed and its run continued', async (t) => {
+  const runsDir = temporaryDirectory(t);
+  const child = await liveOwner(t, runsDir);
+  const exited = once(child, 'exit');
+  child.kill();
+  await exited;
+  assert.throws(() => process.kill(child.pid!, 0));
+  const latest = seedRun(runsDir, '20261013-120000-aaaa', [agent('engineer-1', 'running')]);
+  const stale = ownerClaim(latest, child.pid!);
+  const registry = openRegistry({ runsDir });
+  assert.equal(registry.runDir, latest);
+  assert.equal(existsSync(stale), false);
+  assert.equal(registry.get('engineer-1')?.status, 'interrupted');
+  assert.ok(existsSync(join(latest, `owner-${process.pid}.json`)));
+});
+
+test('our own pid is not a live competing claim', (t) => {
+  const runsDir = temporaryDirectory(t);
+  const latest = seedRun(runsDir, '20261013-120000-aaaa', [agent()]);
+  const own = ownerClaim(latest, process.pid);
+  const registry = openRegistry({ runsDir });
+  assert.equal(registry.runDir, latest);
+  assert.ok(existsSync(own));
+});
+
+test('EPERM from a competing owner is treated as live', (t) => {
+  const runsDir = temporaryDirectory(t);
+  const latest = seedRun(runsDir, '20261013-120000-aaaa', [agent()]);
+  const pid = process.pid + 1;
+  const other = ownerClaim(latest, pid);
+  t.mock.method(process, 'kill', (target: number, signal: number | string) => {
+    assert.equal(target, pid);
+    assert.equal(signal, 0);
+    throw Object.assign(new Error('Access denied'), { code: 'EPERM' });
+  });
+  assert.deepEqual(openRegistry({ runsDir }).list(), []);
+  assert.ok(existsSync(other));
+  assert.equal(existsSync(join(latest, `owner-${process.pid}.json`)), false);
+});
+
+test('close removes only our claim, is idempotent, and leaves a never-written run absent', (t) => {
+  const runsDir = join(temporaryDirectory(t), 'runs');
+  const lazy = openRegistry({ runsDir });
+  lazy.close();
+  lazy.close();
+  assert.equal(existsSync(runsDir), false);
+  const registry = openRegistry({ runsDir });
+  registry.add(agent());
+  const other = ownerClaim(registry.runDir, process.pid + 1);
+  const otherBefore = readFileSync(other, 'utf8');
+  registry.close();
+  registry.close();
+  assert.equal(existsSync(join(registry.runDir, `owner-${process.pid}.json`)), false);
+  assert.equal(readFileSync(other, 'utf8'), otherBefore);
+  assert.deepEqual(saved(registry), [agent()]);
+  assert.throws(() => registry.log('too-late'), /registry is closed.*Open a registry/);
+});
+
+test('a live claim appearing after our claim is written wins the race and our claim is removed', async (t) => {
+  const runsDir = temporaryDirectory(t);
+  const child = await liveOwner(t, runsDir);
+  const latest = seedRun(runsDir, '20261013-120000-aaaa', [agent('engineer-1', 'running')]);
+  const state = join(latest, 'agents.json');
+  const before = readFileSync(state, 'utf8');
+  const own = join(latest, `owner-${process.pid}.json`);
+  const other = join(latest, `owner-${child.pid}.json`);
+  const originalWrite = fs.writeFileSync;
+  let raced = false;
+  const mocked = t.mock.method(fs, 'writeFileSync', (...args: Parameters<typeof fs.writeFileSync>) => {
+    originalWrite(...args);
+    if (args[0] === own) {
+      assert.ok(existsSync(own));
+      originalWrite(other, JSON.stringify({ pid: child.pid, started_at: new Date().toISOString() }));
+      raced = true;
+    }
+  });
+  syncBuiltinESMExports();
+  try {
+    const registry = openRegistry({ runsDir });
+    assert.ok(raced);
+    assert.deepEqual(registry.list(), []);
+    assert.equal(existsSync(registry.runDir), false);
+    assert.equal(existsSync(own), false);
+    assert.ok(existsSync(other));
+    assert.equal(readFileSync(state, 'utf8'), before);
+    assert.equal(existsSync(join(latest, 'log.jsonl')), false);
+  } finally {
+    mocked.mock.restore();
+    syncBuiltinESMExports();
+  }
+});
+
+test('broken state surfaces an error instead of starting or continuing another run', (t) => {
+  const runsDir = temporaryDirectory(t);
+  seedRun(runsDir, '20261012-120000-aaaa', [agent()]);
+  const latest = seedRun(runsDir, '20261013-120000-aaaa', []);
+  for (const text of ['{', '{}', '[null]']) {
+    writeFileSync(join(latest, 'agents.json'), text);
+    assert.throws(() => openRegistry({ runsDir, repo: agent().repo }), /Repair or restore/);
+    assert.deepEqual(readdirSync(latest), ['agents.json']);
+  }
 });

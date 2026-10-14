@@ -47,7 +47,7 @@ function readAgents(file: string, allowMissing = false): AgentRecord[] | undefin
 }
 
 /** Ignore empty health-check runs and old runs, but surface broken state files. */
-export function findLatestRun(runsDir: string): string | undefined {
+export function findLatestRun(runsDir: string, predicate?: (agents: AgentRecord[]) => boolean): string | undefined {
   const directory = resolve(runsDir);
   let entries;
   try {
@@ -59,7 +59,7 @@ export function findLatestRun(runsDir: string): string | undefined {
   const names = entries.filter((entry) => entry.isDirectory()).map((entry) => entry.name).sort().reverse();
   for (const name of names) {
     const agents = readAgents(join(directory, name, 'agents.json'), true);
-    if (agents && agents.length > 0) return name;
+    if (agents && agents.length > 0 && (!predicate || predicate(agents))) return name;
   }
   return undefined;
 }
