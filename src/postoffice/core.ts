@@ -23,14 +23,10 @@ export const DEFAULT_LIMITS: PostOfficeLimits = {
   turn_timeout_ms: 30 * 60_000,
 };
 
-interface PendingTurn {
-  name: string;
-  input: string;
-}
-
 interface ActiveTurn {
   started: number;
   handle?: RunningTurn;
+  recorded?: Promise<void>;
 }
 
 function errorMessage(error: unknown): string {
@@ -50,11 +46,17 @@ export function createPostOffice(opts: PostOfficeOptions): PostOffice {
     }
   }
 
-  const fifo: PendingTurn[] = [];
+  const fifo: string[] = [];
   const running = new Map<string, ActiveTurn>();
   const waiters = new Set<() => void>();
   const closing = new Set<string>();
   let spawning = Promise.resolve();
+  let shuttingDown = false;
+  let shutdownPromise: Promise<void> | undefined;
+
+  function requireOpen(): void {
+    if (shuttingDown) throw new Error('The post office is shutting down. Restart it to continue.');
+  }
 
   function requireAgent(name: string, allowClosed = false): AgentRecord {
     const record = registry.get(name);
@@ -71,17 +73,17 @@ export function createPostOffice(opts: PostOfficeOptions): PostOffice {
   }
 
   function pump(): void {
-    while (running.size < limits.max_parallel && fifo.length) {
-      const pending = fifo.shift()!;
+    while (!shuttingDown && running.size < limits.max_parallel && fifo.length) {
+      const name = fifo.shift()!;
       const active: ActiveTurn = { started: Date.now() };
-      running.set(pending.name, active);
-      void runTurn(pending, active);
+      running.set(name, active);
+      active.recorded = runTurn(name, active);
     }
   }
 
-  function enqueue(name: string, input: string): void {
+  function enqueue(name: string): void {
     registry.update(name, { status: 'queued' });
-    fifo.push({ name, input });
+    fifo.push(name);
     pump();
   }
 
@@ -93,7 +95,7 @@ export function createPostOffice(opts: PostOfficeOptions): PostOffice {
       const record = registry.get(name)!;
       const exists = record.turns.some((saved) => saved.facts.turn === turn.facts.turn);
       registry.update(name, {
-        status: 'idle',
+        status: shuttingDown ? 'interrupted' : 'idle',
         turns: exists
           ? record.turns.map((saved) => saved.facts.turn === turn.facts.turn ? { ...turn, reported: saved.reported } : saved)
           : [...record.turns, turn],
@@ -101,7 +103,7 @@ export function createPostOffice(opts: PostOfficeOptions): PostOffice {
     } catch (failure) {
       failures.push(errorMessage(failure));
       // A transient append failure must not also leave a stale running status.
-      try { registry.update(name, { status: 'idle' }); } catch (statusError) { failures.push(errorMessage(statusError)); }
+      try { registry.update(name, { status: shuttingDown ? 'interrupted' : 'idle' }); } catch (statusError) { failures.push(errorMessage(statusError)); }
     }
     try {
       registry.log('turn.error', { name, turn: turn.facts.turn, error: turn.facts.error, failures });
@@ -111,8 +113,8 @@ export function createPostOffice(opts: PostOfficeOptions): PostOffice {
     }
   }
 
-  async function runTurn(pending: PendingTurn, active: ActiveTurn): Promise<void> {
-    const { name, input } = pending;
+  async function runTurn(name: string, active: ActiveTurn): Promise<void> {
+    let input = '';
     const errors: string[] = [];
     let outcome: EngineTurnOutcome = {
       result: null, exit_code: null, files_touched: [], timed_out: false, cancelled: false,
@@ -138,7 +140,7 @@ export function createPostOffice(opts: PostOfficeOptions): PostOffice {
           usage: outcome.usage,
           timed_out: outcome.timed_out,
           cancelled: outcome.cancelled,
-          error: [outcome.error, ...errors].filter(Boolean).join('\n') || undefined,
+          error: [outcome.error, ...errors, shuttingDown ? 'The post office shut down during the turn.' : undefined].filter(Boolean).join('\n') || undefined,
         },
         reported: false,
       };
@@ -148,7 +150,10 @@ export function createPostOffice(opts: PostOfficeOptions): PostOffice {
       const record = registry.get(name)!;
       number = record.turns.length + 1;
       try {
-        registry.update(name, { status: 'running' });
+        const first = !record.session_id && record.turns.length === 0;
+        input = first ? buildFirstPrompt(record) : buildFollowUpPrompt(record.queued_messages, 'scheduler');
+        // Keep messages durable while waiting for a slot; the first turn cannot deliver them.
+        registry.update(name, { status: 'running', queued_messages: first ? record.queued_messages : [] });
         const directory = registry.agentDir(name);
         writeFileSync(join(directory, `turn-${number}.prompt.md`), input, 'utf8');
         active.handle = engine.startTurn({
@@ -186,7 +191,7 @@ export function createPostOffice(opts: PostOfficeOptions): PostOffice {
 
       turn = makeTurn();
       registry.appendTurn(name, turn);
-      const status = outcome.cancelled ? 'cancelled' : 'idle';
+      const status = shuttingDown ? 'interrupted' : outcome.cancelled ? 'cancelled' : 'idle';
       registry.update(name, { status });
       registry.log('turn.finished', {
         name, turn: number, status, result_status: outcome.result?.status ?? null, error: turn.facts.error,
@@ -198,10 +203,8 @@ export function createPostOffice(opts: PostOfficeOptions): PostOffice {
       running.delete(name);
       try {
         const record = registry.get(name)!;
-        if (!outcome.cancelled && record.queued_messages.length && record.turns.length < limits.max_turns) {
-          const followUp = buildFollowUpPrompt(record.queued_messages, 'scheduler');
-          registry.update(name, { queued_messages: [] });
-          enqueue(name, followUp);
+        if (!shuttingDown && !outcome.cancelled && record.queued_messages.length && record.turns.length < limits.max_turns) {
+          enqueue(name);
         }
       } catch (error) {
         recoverTurn(name, turn ?? makeTurn(), error);
@@ -212,6 +215,7 @@ export function createPostOffice(opts: PostOfficeOptions): PostOffice {
   }
 
   async function spawn(input: SpawnAgentInput) {
+    requireOpen();
     if (typeof input.task?.goal !== 'string' || !input.task.goal.trim()) {
       throw new Error('task.goal must be a non-empty string. Describe the outcome the agent should achieve.');
     }
@@ -219,7 +223,7 @@ export function createPostOffice(opts: PostOfficeOptions): PostOffice {
       throw new Error('Provide at least one of role or brief to describe the agent\'s role.');
     }
     if (registry.list().length >= limits.max_agents) {
-      throw new Error(`This run has reached max_agents (${limits.max_agents}), including closed agents. Start a new run to hire more agents.`);
+      throw new Error(`This run has reached max_agents (${limits.max_agents}), including closed agents. To begin a new run, close this run's remaining agents and restart the post office, or start it with --new-run.`);
     }
     const role = input.role ?? 'custom';
     let brief = input.brief ?? '';
@@ -235,15 +239,17 @@ export function createPostOffice(opts: PostOfficeOptions): PostOffice {
     }
     const repo = resolve(input.repo ?? opts.default_repo);
     // Branches and worktrees outlive runs, and run names restart at 1.
-    const name = registry.allocateName(role, await worktrees.usedNames(repo));
+    const taken = await worktrees.usedNames(repo);
+    requireOpen();
+    const name = registry.allocateName(role, taken);
     const created = await worktrees.create(repo, name, input.base);
     const record: AgentRecord = {
       name, role, brief, task: input.task, engine: engine.kind, hired_by: 'scheduler', repo,
-      ...created, status: 'queued', turns: [], queued_messages: [], created_at: new Date().toISOString(),
+      ...created, status: shuttingDown ? 'interrupted' : 'queued', turns: [], queued_messages: [], created_at: new Date().toISOString(),
     };
     registry.add(record);
     registry.log('agent.spawned', { name, role, repo, ...created });
-    enqueue(name, buildFirstPrompt(record));
+    if (!shuttingDown) enqueue(name);
     return { name, branch: created.branch, worktree: created.worktree, status: registry.get(name)!.status };
   }
 
@@ -264,28 +270,29 @@ export function createPostOffice(opts: PostOfficeOptions): PostOffice {
   }
 
   return {
-    spawnAgent(input) {
+    async spawnAgent(input) {
+      requireOpen();
       // Worktree creation yields; reserve names and agent capacity by serializing this operation.
       const result = spawning.then(() => spawn(input));
       spawning = result.then(() => {}, () => {});
       return result;
     },
     async sendMessage({ to, text }) {
+      requireOpen();
       const record = requireAgent(to);
       if (record.turns.length + (isPending(record) ? 1 : 0) >= limits.max_turns) {
         throw new Error(`Agent "${to}" has reached max_turns (${limits.max_turns}). Spawn a new agent to continue.`);
       }
-      if (isPending(record)) {
-        registry.update(to, { queued_messages: [...record.queued_messages, text] });
-        return { delivery: 'queued' };
-      }
-      if (!record.session_id) {
+      if (!isPending(record) && !record.session_id && record.turns.length) {
         throw new Error(`Agent "${to}" has no session_id: there is nothing to resume because the first turn never started. Spawn a new agent to continue.`);
       }
-      enqueue(to, buildFollowUpPrompt([text], 'scheduler'));
+      registry.update(to, { queued_messages: [...record.queued_messages, text] });
+      if (isPending(record)) return { delivery: 'queued' };
+      enqueue(to);
       return { delivery: registry.get(to)!.status === 'running' ? 'started' : 'queued' };
     },
     async wait({ agents, timeout_s = 600 }) {
+      requireOpen();
       const names = [...new Set(agents ?? registry.list().map((record) => record.name))];
       for (const name of names) {
         if (!registry.get(name)) throw new Error(`Unknown agent "${name}". Use list_agents to find an existing agent.`);
@@ -296,6 +303,7 @@ export function createPostOffice(opts: PostOfficeOptions): PostOffice {
       return new Promise<WaitOutput>((resolveWait, rejectWait) => {
         const finish = (timedOut = false): void => {
           try {
+            requireOpen();
             const output = collect(names);
             if (!timedOut && !output.finished.length && output.pending.length) return;
             clearTimeout(timer);
@@ -325,7 +333,7 @@ export function createPostOffice(opts: PostOfficeOptions): PostOffice {
       if (record.status === 'running') {
         running.get(name)?.handle?.cancel();
       } else if (record.status === 'queued') {
-        const index = fifo.findIndex((pending) => pending.name === name);
+        const index = fifo.indexOf(name);
         if (index !== -1) fifo.splice(index, 1);
         registry.update(name, { status: 'cancelled' });
         pump();
@@ -345,9 +353,18 @@ export function createPostOffice(opts: PostOfficeOptions): PostOffice {
         closing.delete(name);
       }
     },
-    // Placeholder until the run lifecycle lands.
-    async shutdown() {
-      throw new Error('shutdown is not implemented yet.');
+    shutdown() {
+      if (shutdownPromise) return shutdownPromise;
+      shuttingDown = true;
+      wakeWaiters();
+      fifo.length = 0;
+      for (const record of registry.list()) {
+        if (record.status === 'queued') registry.update(record.name, { status: 'interrupted' });
+      }
+      for (const active of running.values()) active.handle?.cancel();
+      // Include in-flight worktree creation so callers can safely close the registry afterwards.
+      shutdownPromise = Promise.all([spawning, ...[...running.values()].map((active) => active.recorded)]).then(() => {});
+      return shutdownPromise;
     },
   };
 }
