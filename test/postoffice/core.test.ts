@@ -375,11 +375,12 @@ for (const status of ['idle', 'cancelled', 'interrupted'] as const) {
     const next = f.restart();
     const startTurn = f.engine.startTurn;
     f.engine.startTurn = (request) => {
-      assert.deepEqual(persisted().queued_messages, []);
+      assert.deepEqual(persisted().queued_messages, [...messages, 'Newest message.']);
       assert.equal(request.prompt, buildFollowUpPrompt([...messages, 'Newest message.'], 'scheduler'));
       return startTurn(request);
     };
     assert.equal((await next.sendMessage({ to: agent.name, text: 'Newest message.' })).delivery, 'started');
+    assert.deepEqual(persisted().queued_messages, []);
     await f.drain(next);
     assert.equal(f.registry.get(agent.name)!.turns.length, 2);
   });
@@ -645,6 +646,91 @@ test('unexpected start and persistence exceptions are recorded and release the r
   assert.equal(f.registry.get(second.name)!.turns.length, 1);
   assert.equal(f.registry.get(second.name)!.status, 'idle');
   assert.match(readFileSync(join(f.registry.runDir, 'log.jsonl'), 'utf8'), /turn.error/);
+});
+
+test('a failed launch retains messages without automatically retrying and the next sendMessage delivers them', async (t) => {
+  const f = await fixture(t, { max_turns: 4 });
+  const agent = await f.office.spawnAgent({ brief: 'Role', task: { goal: 'Finish.' } });
+  await f.drain();
+  f.registry.update(agent.name, { queued_messages: ['Oldest message.'] });
+  const startTurn = f.engine.startTurn;
+  let attempts = 0;
+  f.engine.startTurn = () => {
+    attempts++;
+    throw new Error('persistent launch failure');
+  };
+  await f.office.sendMessage({ to: agent.name, text: 'Second message.' });
+  const reports = await f.drain();
+  assert.equal(attempts, 1, 'a failure before the engine accepts the turn must not retry automatically');
+  assert.equal(reports.length, 1);
+  assert.match(reports[0]!.facts.error!, /persistent launch failure/);
+  const record = f.registry.get(agent.name)!;
+  assert.equal(record.status, 'idle');
+  assert.equal(record.turns.length, 2);
+  assert.equal(record.turns[1]!.reported, true);
+  assert.deepEqual(record.queued_messages, ['Oldest message.', 'Second message.']);
+  f.engine.startTurn = startTurn;
+  await f.office.sendMessage({ to: agent.name, text: 'Retry now.' });
+  await f.drain();
+  assert.equal(f.registry.get(agent.name)!.turns[2]!.input,
+    buildFollowUpPrompt(['Oldest message.', 'Second message.', 'Retry now.'], 'scheduler'));
+  assert.deepEqual(f.registry.get(agent.name)!.queued_messages, []);
+});
+
+test('a failed queue clear still awaits the accepted turn and records its real result before retrying delivery', async (t) => {
+  const f = await fixture(t);
+  const agent = await f.office.spawnAgent({ brief: 'Role', task: { goal: 'Finish.' } });
+  await f.drain();
+  const session = f.registry.get(agent.name)!.session_id;
+  const update = f.registry.update;
+  let fail = true;
+  f.registry.update = (name, patch) => {
+    if (fail && patch.queued_messages?.length === 0) {
+      fail = false;
+      throw new Error('disk full during queue clear');
+    }
+    return update(name, patch);
+  };
+  const startTurn = f.engine.startTurn;
+  let running = 0;
+  let peakRunning = 0;
+  f.engine.startTurn = (request) => {
+    const turn = startTurn(request);
+    running++;
+    peakRunning = Math.max(peakRunning, running);
+    void turn.done.then(() => { running--; });
+    return turn;
+  };
+  const commitAll = f.worktrees.commitAll;
+  const runningAtCommit: number[] = [];
+  f.worktrees.commitAll = async (...args) => {
+    runningAtCommit.push(running);
+    return commitAll(...args);
+  };
+  try {
+    const text = 'Finish before recording.\nFAKE: sleep 300\nFAKE: write accepted.txt finished';
+    await f.office.sendMessage({ to: agent.name, text });
+    assert.equal(fail, false);
+    assert.equal(f.registry.get(agent.name)!.status, 'running');
+    assert.deepEqual(f.registry.get(agent.name)!.queued_messages, [text]);
+    const reports = await f.drain();
+    assert.equal(reports.length, 2, 'retained messages may be delivered again after the accepted turn finishes');
+    assert.equal(reports[0]!.result?.summary, `fake turn 2 of session ${session}`);
+    assert.equal(reports[0]!.facts.exit_code, 0);
+    assert.equal(reports[0]!.facts.cancelled, false);
+    assert.match(reports[0]!.facts.error!, /Cannot clear queued messages: disk full during queue clear/);
+    assert.ok(reports[0]!.facts.commit);
+    assert.equal(await git(agent.worktree, 'show', `${reports[0]!.facts.commit}:accepted.txt`), 'finished');
+    assert.equal(reports[1]!.result?.summary, `fake turn 3 of session ${session}`);
+    assert.equal(reports[1]!.facts.error, undefined);
+    assert.deepEqual(runningAtCommit, [0, 0]);
+    assert.equal(peakRunning, 1, 'the same session must never have overlapping processes');
+    assert.equal(running, 0, 'every accepted process must have resolved done before wait reports completion');
+    assert.equal(f.registry.get(agent.name)!.status, 'idle');
+    assert.deepEqual(f.registry.get(agent.name)!.queued_messages, []);
+  } finally {
+    await Promise.all(f.started.map(({ turn }) => turn.done));
+  }
 });
 
 test('auto-commit messages use only the first 100 characters of the first summary line', async (t) => {

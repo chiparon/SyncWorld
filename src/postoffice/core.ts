@@ -152,8 +152,7 @@ export function createPostOffice(opts: PostOfficeOptions): PostOffice {
       try {
         const first = !record.session_id && record.turns.length === 0;
         input = first ? buildFirstPrompt(record) : buildFollowUpPrompt(record.queued_messages, 'scheduler');
-        // Keep messages durable while waiting for a slot; the first turn cannot deliver them.
-        registry.update(name, { status: 'running', queued_messages: first ? record.queued_messages : [] });
+        registry.update(name, { status: 'running' });
         const directory = registry.agentDir(name);
         writeFileSync(join(directory, `turn-${number}.prompt.md`), input, 'utf8');
         active.handle = engine.startTurn({
@@ -166,6 +165,12 @@ export function createPostOffice(opts: PostOfficeOptions): PostOffice {
           stderr_path: join(directory, 'stderr.log'),
           timeout_ms: limits.turn_timeout_ms,
         });
+        // A failed launch has not delivered anything; the first turn cannot deliver messages either.
+        if (!first) {
+          // Once launched, a persistence failure must not let us stop awaiting the process.
+          try { registry.update(name, { queued_messages: [] }); }
+          catch (error) { errors.push(`Cannot clear queued messages: ${errorMessage(error)}`); }
+        }
         const sessionSaved = active.handle.sessionId.then((session_id) => {
           if (session_id !== undefined && registry.get(name)?.session_id === undefined) {
             registry.update(name, { session_id });
@@ -203,7 +208,7 @@ export function createPostOffice(opts: PostOfficeOptions): PostOffice {
       running.delete(name);
       try {
         const record = registry.get(name)!;
-        if (!shuttingDown && !outcome.cancelled && record.queued_messages.length && record.turns.length < limits.max_turns) {
+        if (active.handle && !shuttingDown && !outcome.cancelled && record.queued_messages.length && record.turns.length < limits.max_turns) {
           enqueue(name);
         }
       } catch (error) {
@@ -354,6 +359,7 @@ export function createPostOffice(opts: PostOfficeOptions): PostOffice {
       }
     },
     shutdown() {
+      // Event-driven shutdown relies on pump() assigning the handle and recorded promise synchronously.
       if (shutdownPromise) return shutdownPromise;
       shuttingDown = true;
       wakeWaiters();

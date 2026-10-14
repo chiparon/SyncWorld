@@ -366,6 +366,36 @@ test('a closed latest run starts a new run instead of continuing an older unfini
   assert.deepEqual(readdirSync(latest), ['agents.json']);
 });
 
+test('a run closed during claiming keeps its state and log unchanged and releases our claim', (t) => {
+  const runsDir = temporaryDirectory(t);
+  const record = agent('engineer-1', 'running');
+  const latest = seedRun(runsDir, '20261013-120000-aaaa', [record]);
+  const state = join(latest, 'agents.json');
+  const log = join(latest, 'log.jsonl');
+  const previousLog = '{"event":"last-save"}\n';
+  writeFileSync(log, previousLog);
+  const closedState = JSON.stringify([{ ...record, status: 'closed' }]);
+  const write = fs.writeFileSync;
+  const mocked = t.mock.method(fs, 'writeFileSync', (...args: Parameters<typeof fs.writeFileSync>) => {
+    if (args[0] === join(latest, `owner-${process.pid}.json`)) write(state, closedState);
+    return write(...args);
+  });
+  syncBuiltinESMExports();
+  try {
+    const registry = openRegistry({ runsDir });
+    assert.notEqual(registry.runDir, latest);
+    assert.deepEqual(registry.list(), []);
+    assert.equal(existsSync(registry.runDir), false);
+    assert.equal(readFileSync(state, 'utf8'), closedState);
+    assert.equal(readFileSync(log, 'utf8'), previousLog);
+    assert.deepEqual(readdirSync(latest).sort(), ['agents.json', 'log.jsonl']);
+    registry.close();
+  } finally {
+    mocked.mock.restore();
+    syncBuiltinESMExports();
+  }
+});
+
 test('mode new ignores an unfinished run without claiming or interrupting it', (t) => {
   const runsDir = temporaryDirectory(t);
   const latest = seedRun(runsDir, '20261013-120000-aaaa', [agent('engineer-1', 'running')]);
