@@ -1,7 +1,6 @@
 import { randomInt, randomUUID } from 'node:crypto';
 import {
   appendFileSync,
-  existsSync,
   mkdirSync,
   readFileSync,
   readdirSync,
@@ -12,6 +11,7 @@ import {
 import { join, resolve } from 'node:path';
 
 import type { AgentRecord, OpenRegistryOptions, Registry } from '../schema/types.ts';
+import { findLatestRun } from '../status/read.ts';
 
 function newRunId(): string {
   const now = new Date();
@@ -21,38 +21,60 @@ function newRunId(): string {
   return `${date}-${time}-${randomInt(36 ** 4).toString(36).padStart(4, '0')}`;
 }
 
+function claimRun(runDir: string): boolean {
+  const ownClaim = join(runDir, `owner-${process.pid}.json`);
+  let claimed = false;
+  try {
+    writeFileSync(ownClaim, `${JSON.stringify({ pid: process.pid, started_at: new Date().toISOString() })}\n`);
+    for (const name of readdirSync(runDir)) {
+      const match = /^owner-(\d+)\.json$/.exec(name);
+      if (!match) continue;
+      const pid = Number(match[1]);
+      if (pid === process.pid) continue;
+      let live = false;
+      try {
+        process.kill(pid, 0);
+        live = true;
+      } catch (error) {
+        live = (error as NodeJS.ErrnoException).code === 'EPERM';
+      }
+      if (live) return false;
+      rmSync(join(runDir, name), { force: true });
+    }
+    claimed = true;
+    return true;
+  } finally {
+    if (!claimed) rmSync(ownClaim, { force: true });
+  }
+}
+
+function repoPath(repo: string): string {
+  const absolute = resolve(repo);
+  return process.platform === 'win32' ? absolute.toLowerCase() : absolute;
+}
+
 export function openRegistry(opts: OpenRegistryOptions): Registry {
   const runsDir = resolve(opts.runsDir);
-  mkdirSync(runsDir, { recursive: true });
-
-  // Placeholder until the run lifecycle lands: 'continue' reopens the newest run with state.
-  let runId = opts.mode === 'continue'
-    ? readdirSync(runsDir, { withFileTypes: true })
-        .filter((entry) => entry.isDirectory() && existsSync(join(runsDir, entry.name, 'agents.json')))
-        .map((entry) => entry.name)
-        .sort()
-        .at(-1)
-    : undefined;
-  const reopening = runId !== undefined;
-
-  if (runId === undefined) {
-    // Exclusive creation also keeps two runs started in the same second separate.
-    for (;;) {
-      runId = newRunId();
-      try {
-        mkdirSync(join(runsDir, runId));
-        break;
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
-      }
-    }
-  }
+  const repo = opts.repo === undefined ? undefined : repoPath(opts.repo);
+  let candidateAgents: AgentRecord[] = [];
+  const candidate = opts.mode === 'new' ? undefined : findLatestRun(runsDir, (agents) => {
+    if (repo !== undefined && !agents.some((agent) => repoPath(agent.repo) === repo)) return false;
+    candidateAgents = agents;
+    return true;
+  });
+  const reopening = candidate !== undefined
+    && candidateAgents.some((agent) => agent.status !== 'closed')
+    && claimRun(join(runsDir, candidate));
+  const runId = reopening ? candidate! : newRunId();
 
   const runDir = join(runsDir, runId);
   const statePath = join(runDir, 'agents.json');
-  let records: AgentRecord[] = reopening ? JSON.parse(readFileSync(statePath, 'utf8')) : [];
+  const ownClaim = join(runDir, `owner-${process.pid}.json`);
+  let onDisk = reopening;
+  let closed = false;
+  let records: AgentRecord[] = [];
 
-  function persist(next: AgentRecord[]): void {
+  function writeState(next: AgentRecord[]): void {
     const temporaryPath = join(runDir, `agents.${randomUUID()}.tmp`);
     try {
       writeFileSync(temporaryPath, `${JSON.stringify(next, null, 2)}\n`, { flag: 'wx' });
@@ -62,6 +84,28 @@ export function openRegistry(opts: OpenRegistryOptions): Registry {
     } finally {
       rmSync(temporaryPath, { force: true });
     }
+  }
+
+  function ensureOnDisk(): void {
+    if (closed) throw new Error('This registry is closed. Open a registry before writing again.');
+    if (onDisk) return;
+    mkdirSync(runsDir, { recursive: true });
+    try {
+      mkdirSync(runDir);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+      throw new Error(`Cannot create run "${runDir}": the directory already exists. Open a new registry to get a new run id and retry.`);
+    }
+    if (!claimRun(runDir)) {
+      throw new Error(`Cannot claim run "${runDir}": another live post office owns it. Open a new registry and retry.`);
+    }
+    onDisk = true;
+    writeState(records);
+  }
+
+  function persist(next: AgentRecord[]): void {
+    ensureOnDisk();
+    writeState(next);
   }
 
   function requireRecord(name: string): AgentRecord {
@@ -104,27 +148,41 @@ export function openRegistry(opts: OpenRegistryOptions): Registry {
       return registry.update(name, { turns: [...requireRecord(name).turns, turn] });
     },
     agentDir(name) {
+      ensureOnDisk();
       const directory = join(runDir, name);
       mkdirSync(directory, { recursive: true });
       return directory;
     },
     log(event, data) {
+      ensureOnDisk();
       appendFileSync(
         join(runDir, 'log.jsonl'),
         `${JSON.stringify({ ts: new Date().toISOString(), event, ...data })}\n`,
       );
     },
-    // Placeholder until the run lifecycle lands: there is no claim to release yet.
-    close() {},
+    close() {
+      if (closed) return;
+      if (onDisk) rmSync(ownClaim, { force: true });
+      closed = true;
+    },
   };
 
-  const interrupted = records
-    .filter((agent) => agent.status === 'queued' || agent.status === 'running')
-    .map((agent) => agent.name);
-  persist(records.map((agent) => (
-    interrupted.includes(agent.name) ? { ...agent, status: 'interrupted' } : agent
-  )));
-  if (reopening) registry.log('registry.reopened', { interrupted });
+  if (reopening) {
+    try {
+      // Read again after claiming: a previous owner may have saved while we were selecting.
+      records = JSON.parse(readFileSync(statePath, 'utf8'));
+      const interrupted = records
+        .filter((agent) => agent.status === 'queued' || agent.status === 'running')
+        .map((agent) => agent.name);
+      persist(records.map((agent) => (
+        interrupted.includes(agent.name) ? { ...agent, status: 'interrupted' } : agent
+      )));
+      registry.log('registry.reopened', { interrupted });
+    } catch (error) {
+      registry.close();
+      throw error;
+    }
+  }
 
   return registry;
 }
