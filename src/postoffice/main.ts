@@ -3,6 +3,8 @@ import { readFileSync, realpathSync, writeSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { parseArgs, promisify } from 'node:util';
+import { accessSync } from 'node:fs';
+import { constants } from 'node:fs';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 
 import { createCodexEngine } from '../engines/codex.ts';
@@ -14,6 +16,21 @@ import { createWorktrees } from './worktrees.ts';
 
 const root = fileURLToPath(new URL('../../', import.meta.url));
 const execute = promisify(execFile);
+
+/** Find the nearest .git directory by walking up from the given path. */
+function findGitRoot(start: string): string | undefined {
+  let current = resolve(start);
+  const root = resolve('/');
+  while (current !== root) {
+    try {
+      accessSync(join(current, '.git'), constants.F_OK);
+      return current;
+    } catch {
+      current = resolve(current, '..');
+    }
+  }
+  return undefined;
+}
 
 export function readOptions(args = process.argv.slice(2), env: NodeJS.ProcessEnv = process.env) {
   const { values } = parseArgs({
@@ -39,8 +56,22 @@ export function readOptions(args = process.argv.slice(2), env: NodeJS.ProcessEnv
     }
     limits[key] = value;
   }
+  // Resolve repo: explicit --repo > walk up from cwd > error
+  let repo: string;
+  if (values.repo) {
+    repo = resolve(values.repo);
+  } else {
+    const discovered = findGitRoot(process.cwd());
+    if (!discovered) {
+      throw new Error(
+        `No Git repository found. Syncw must run in a Git worktree or receive --repo. `
+        + `Current directory: ${process.cwd()}. Walk up the directory tree and found no .git/ directory.`,
+      );
+    }
+    repo = discovered;
+  }
   return {
-    repo: resolve(values.repo ?? process.cwd()),
+    repo,
     runsDir: resolve(env.SYNCW_RUNS_DIR ?? join(root, 'runs')),
     mode: values['new-run'] ? 'new' as const : 'continue' as const,
     limits,
