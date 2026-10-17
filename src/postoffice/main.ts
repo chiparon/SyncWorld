@@ -56,22 +56,18 @@ export function readOptions(args = process.argv.slice(2), env: NodeJS.ProcessEnv
     }
     limits[key] = value;
   }
-  // Resolve repo: explicit --repo > walk up from cwd > error
+  // Resolve repo: explicit --repo > walk up from cwd > fallback to Syncw root
   let repo: string;
+  let explicitRepo = false;
   if (values.repo) {
     repo = resolve(values.repo);
+    explicitRepo = true;
   } else {
-    const discovered = findGitRoot(process.cwd());
-    if (!discovered) {
-      throw new Error(
-        `No Git repository found. Syncw must run in a Git worktree or receive --repo. `
-        + `Current directory: ${process.cwd()}. Walk up the directory tree and found no .git/ directory.`,
-      );
-    }
-    repo = discovered;
+    repo = findGitRoot(process.cwd()) ?? root;
   }
   return {
     repo,
+    explicitRepo,
     runsDir: resolve(env.SYNCW_RUNS_DIR ?? join(root, 'runs')),
     mode: values['new-run'] ? 'new' as const : 'continue' as const,
     limits,
@@ -80,19 +76,20 @@ export function readOptions(args = process.argv.slice(2), env: NodeJS.ProcessEnv
 
 export async function main(args = process.argv.slice(2)): Promise<void> {
   const options = readOptions(args);
-  // Reject configuration errors before creating a run or accepting MCP requests.
-  try {
-    await execute('git', ['-C', options.repo, 'rev-parse', '--show-toplevel'], { windowsHide: true });
-  } catch (error) {
-    throw new Error(
-      `Cannot use repository "${options.repo}". Set --repo to a Git working tree and ensure Git is installed. `
-        + (error instanceof Error ? error.message : String(error)),
-      { cause: error },
-    );
-  }
+  // Defer repo validation: it will be checked when spawn_agent is called.
+  // This allows MCP server to start even if cwd is not a git repository.
+  // If --repo was explicit or repo was discovered, it will still be validated when used.
   const instructions = readFileSync(join(root, 'roles', 'scheduler.md'), 'utf8');
   const engine = createCodexEngine();
   const registry = openRegistry({ runsDir: options.runsDir, mode: options.mode, repo: options.repo });
+  // Only validate repo when explicitly passed via --repo
+  if (options.explicitRepo) {
+    try {
+      await execute('git', ['rev-parse', '--git-dir'], { cwd: options.repo });
+    } catch {
+      throw new Error(`Cannot use repository ${options.repo}. Set --repo to a Git working tree, or run from inside one.`);
+    }
+  }
   const signals = ['SIGINT', 'SIGTERM', 'SIGHUP'] as const;
   let stop: (() => void) | undefined;
   try {
