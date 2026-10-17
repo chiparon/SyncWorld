@@ -85,6 +85,9 @@ function stubPostOffice() {
     async closeAgent(name, opts) {
       calls.push({ method: 'closeAgent', args: [name, opts] });
     },
+    async shutdown() {
+      calls.push({ method: 'shutdown', args: [] });
+    },
   };
   return { po, calls };
 }

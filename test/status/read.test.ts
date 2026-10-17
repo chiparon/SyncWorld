@@ -58,6 +58,33 @@ test('newest non-empty run wins by name, skipping empty runs and old directories
   assert.equal(readFileSync(join(selected, 'agents.json'), 'utf8'), before);
 });
 
+test('latest-run predicate selects the newest matching non-empty run and leaves the default unchanged', (t) => {
+  const { runsDir, run } = fixture(t);
+  run('a-older', [agent({ repo: '/matching' })]);
+  run('b-selected', [agent(), agent({ name: 'engineer-2', repo: '/matching' })]);
+  run('c-other', [agent({ repo: '/other' })]);
+  run('d-empty', []);
+  run('e-missing');
+  const visited: AgentRecord[][] = [];
+  assert.equal(findLatestRun(runsDir, (agents) => {
+    visited.push(agents);
+    return agents.some((record) => record.repo === '/matching');
+  }), 'b-selected');
+  assert.deepEqual(visited.map((agents) => agents.map((record) => record.repo)), [['/other'], ['/repo', '/matching']]);
+  assert.equal(findLatestRun(runsDir), 'c-other');
+  assert.equal(findLatestRun(runsDir, () => false), undefined);
+  assert.equal(findLatestRun(runsDir, () => true), 'c-other');
+  assert.equal(findLatestRun(join(runsDir, 'absent'), () => true), undefined);
+});
+
+test('a predicate cannot hide broken state files', (t) => {
+  const { runsDir, run } = fixture(t);
+  run('a-older', [agent()]);
+  const directory = run('z-broken');
+  writeFileSync(join(directory, 'agents.json'), '{');
+  assert.throws(() => findLatestRun(runsDir, () => false), /Invalid JSON.*Repair or restore/);
+});
+
 test('explicit run selects an older run or an empty run and preserves agent order and last turn', (t) => {
   const { runsDir, run } = fixture(t);
   const directory = run('older', [agent({ turns: [turn], queued_messages: ['next'] }), agent({ name: 'reviewer-1' })]);

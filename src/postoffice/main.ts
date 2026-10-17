@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process';
-import { readFileSync, realpathSync } from 'node:fs';
+import { readFileSync, realpathSync, writeSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { parseArgs, promisify } from 'node:util';
@@ -18,7 +18,7 @@ const execute = promisify(execFile);
 export function readOptions(args = process.argv.slice(2), env: NodeJS.ProcessEnv = process.env) {
   const { values } = parseArgs({
     args,
-    options: { repo: { type: 'string' }, reopen: { type: 'boolean' } },
+    options: { repo: { type: 'string' }, 'new-run': { type: 'boolean' } },
     strict: true,
     allowPositionals: false,
   });
@@ -42,7 +42,7 @@ export function readOptions(args = process.argv.slice(2), env: NodeJS.ProcessEnv
   return {
     repo: resolve(values.repo ?? process.cwd()),
     runsDir: resolve(env.SYNCW_RUNS_DIR ?? join(root, 'runs')),
-    reopenLatest: values.reopen ?? false,
+    mode: values['new-run'] ? 'new' as const : 'continue' as const,
     limits,
   };
 }
@@ -61,18 +61,61 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
   }
   const instructions = readFileSync(join(root, 'roles', 'scheduler.md'), 'utf8');
   const engine = createCodexEngine();
-  const registry = openRegistry({ runsDir: options.runsDir, reopenLatest: options.reopenLatest });
-  const po = createPostOffice({
-    registry,
-    worktrees: createWorktrees(),
-    engine,
-    roles_dir: join(root, 'roles'),
-    default_repo: options.repo,
-    result_schema_path: join(root, 'src', 'schema', 'result.schema.json'),
-    limits: options.limits,
-  });
-  const server = createServer(po, { instructions });
-  await server.connect(new StdioServerTransport());
+  const registry = openRegistry({ runsDir: options.runsDir, mode: options.mode, repo: options.repo });
+  const signals = ['SIGINT', 'SIGTERM', 'SIGHUP'] as const;
+  let stop: (() => void) | undefined;
+  try {
+    const po = createPostOffice({
+      registry,
+      worktrees: createWorktrees(),
+      engine,
+      roles_dir: join(root, 'roles'),
+      default_repo: options.repo,
+      result_schema_path: join(root, 'src', 'schema', 'result.schema.json'),
+      limits: options.limits,
+    });
+    let stopping = false;
+    function exit(code: number, diagnostic?: string): never {
+      try {
+        registry.close();
+      } finally {
+        // A synchronous write preserves the diagnostic even when pipes are still open.
+        try {
+          if (diagnostic) writeSync(2, `${diagnostic.replace(/[\r\n]+/g, ' ')}\n`);
+        } finally {
+          process.exit(code);
+        }
+      }
+    }
+    stop = () => {
+      if (stopping) return;
+      stopping = true;
+      // Keep this timer referenced: shutdown must finish or force the process to exit.
+      const deadline = setTimeout(() => exit(1, 'Syncw shutdown timed out after 10 seconds; released the run claim.'), 10_000);
+      void (async () => {
+        try {
+          await po.shutdown();
+          clearTimeout(deadline);
+          exit(0);
+        } catch (error) {
+          exit(1, `Syncw shutdown failed: ${error instanceof Error ? error.message : String(error)}`);
+        }
+      })();
+    };
+    // The SDK transport listens for data, but does not handle the client's EOF.
+    process.stdin.on('end', stop);
+    for (const signal of signals) process.on(signal, stop);
+    const server = createServer(po, { instructions });
+    await server.connect(new StdioServerTransport());
+    if (process.stdin.readableEnded) stop();
+  } catch (error) {
+    if (stop) {
+      process.stdin.off('end', stop);
+      for (const signal of signals) process.off(signal, stop);
+    }
+    registry.close();
+    throw error;
+  }
 }
 
 /**

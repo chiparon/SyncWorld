@@ -141,7 +141,7 @@ post office 不完全相信 worker 的自述。它会在结果上补充几项可
 
 **规则**：
 - 一个 worker 同一时间只跑一轮。这期间收到的消息先排队，下一轮一起送达。
-- post office 会把所有 agent 的状态写到磁盘。post office 重启后，之前还在运行的 worker 会被标记为"中断"，之后可以用 `send_message` 续接。
+- post office 会把所有 agent 的状态写到磁盘，重启后默认接着当前仓库最近一次尚未结束的运行，之前还在运行的 worker 标记为"中断"，可用 `send_message` 续接；用 `--new-run` 或关闭上一轮的所有 agent 后重启，可以另起一轮。健康检查或第二个会话不会打扰仍在运行的 post office，没有雇人就不会创建新的运行目录。
 
 **限制**：由 post office 强制执行，agent 无法修改。
 
@@ -175,6 +175,7 @@ worker 沿用你的 Codex 配置（`~/.codex/config.toml`），包括模型 `gpt
   - `agents.json`：所有 agent 的状态
   - `<agent 名>/events.jsonl`：Codex 的完整事件流
   - `<agent 名>/turn-<n>.json`：每一轮的结果
+  - `owner-<进程号>.json`：正在使用这次运行的 post office；它退出时会删掉这个文件
 - **在 git 里**：每个 worker 一个分支，每一轮一个 commit。
 
 ---
